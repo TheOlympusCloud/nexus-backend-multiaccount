@@ -3,6 +3,8 @@ pub mod device;
 pub mod manager;
 pub mod store;
 pub mod session;
+#[cfg(unix)]
+mod transaction;
 
 pub use manager::{PASSPORT_STS, TokenManager};
 

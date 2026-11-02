@@ -39,6 +39,13 @@ fn deletion_result(result: Result<(), keyring_core::Error>) -> Result<(), TokenS
 pub struct KeychainBackend;
 
 impl TokenBackend for KeychainBackend {
+    #[cfg(unix)]
+    fn mutation_lock(&self) -> Result<Box<dyn crate::tokens::store::TokenMutationGuard + '_>, TokenStoreError> {
+        let uid = unsafe { libc::geteuid() };
+        // Stable across CLI/service environments; do not key this on TMPDIR.
+        let root = std::path::PathBuf::from(format!("/tmp/xodus-nexus-credentials-{uid}"));
+        Ok(Box::new(crate::tokens::transaction::lock_at(&root, std::time::Duration::from_secs(15))?))
+    }
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
         let entry = crate::secrets::get_entry(key)?;
         match entry.get_secret() {

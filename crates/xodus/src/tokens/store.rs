@@ -1,6 +1,17 @@
 use std::time::Instant;
 
+pub trait TokenMutationGuard {}
+impl<T> TokenMutationGuard for T {}
+static PROCESS_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub trait TokenBackend: Send + Sync {
+    /// Hold across read/merge/write/verification, never across network work.
+    /// Persistent backends shared across processes must override this guard.
+    fn mutation_lock(&self) -> Result<Box<dyn TokenMutationGuard + '_>, TokenStoreError> {
+        Ok(Box::new(PROCESS_WRITES.lock().map_err(|_| {
+            std::io::Error::other("Credential update was interrupted")
+        })?))
+    }
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, TokenStoreError>;
     fn set(&self, key: &str, value: &[u8]) -> Result<(), TokenStoreError>;
     fn remove(&self, key: &str) -> Result<(), TokenStoreError>;

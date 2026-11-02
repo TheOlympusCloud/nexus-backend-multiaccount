@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::models::secrets::{Device, Token, TokenStore, User};
@@ -65,10 +65,6 @@ mod credential_account_metadata_tests {
 pub struct TokenManager {
     persistent: Arc<dyn TokenBackend>,
     ephemeral: Arc<dyn ExpiringTokenBackend>,
-    // Serialize full read/merge/write/verify operations among this manager's
-    // clones. Individual backend get/set locks do not protect a transaction.
-    // Independent managers/processes still require backend-level coordination.
-    persistent_updates: Arc<Mutex<()>>,
 }
 
 impl TokenManager {
@@ -79,7 +75,6 @@ impl TokenManager {
         Self {
             persistent,
             ephemeral,
-            persistent_updates: Arc::new(Mutex::new(())),
         }
     }
 
@@ -262,10 +257,8 @@ impl TokenManager {
 
     // ---- shared TokenStore read/modify/write helper ---------------------------
 
-    fn persistent_update(&self) -> Result<MutexGuard<'_, ()>, TokenStoreError> {
-        self.persistent_updates.lock().map_err(|_| {
-            std::io::Error::other("Credential update was interrupted").into()
-        })
+    fn persistent_update(&self) -> Result<Box<dyn crate::tokens::store::TokenMutationGuard + '_>, TokenStoreError> {
+        self.persistent.mutation_lock()
     }
 
     fn write_verified(
