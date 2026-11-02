@@ -699,6 +699,19 @@ async fn prepare(_lfiles: &HashMap<String, SegmentFile>) -> (impl AsyncFnOnce(),
     (async || {}, "".to_owned())
 }
 
+/// What the runtime may do with its offline identity for this launch:
+/// `use` it (the launch runs on a validated stored license), `store` it (this
+/// device holds a fresh offline lease), or neither.
+pub fn offline_identity_mode(license_used: bool, lease_stored: bool) -> Option<&'static str> {
+    if license_used {
+        Some("use")
+    } else if lease_stored {
+        Some("store")
+    } else {
+        None
+    }
+}
+
 pub async fn run(
     client: &reqwest::Client,
     tokens: &TokenManager,
@@ -919,10 +932,21 @@ pub async fn run(
         .env("WINE_DLL_FILE_MAP", env_value)
         .env("WINE_EXE_FILE_MAP", exe_env_value);
     if offline {
-        // The runtime treats the network as unreachable at once and completes
-        // the Xbox sign-in from its cached identity instead of waiting for
-        // its own connect timeouts (xuser-offline-identity-v1).
+        // The runtime treats the network as unreachable at once instead of
+        // waiting for its own connect timeouts.
         command.env("XODUS_FORCE_OFFLINE", "1");
+    }
+    // The runtime's offline identity follows the license decision, never its
+    // own (xuser-offline-identity-v2): it may sign in from the cached identity
+    // only on a launch running on a stored license that passed its lease
+    // checks, and keep the identity only when Microsoft issued this device an
+    // offline lease. Otherwise it removes the account's cached identity.
+    command.env_remove("XODUS_OFFLINE_IDENTITY");
+    if let Some(mode) = offline_identity_mode(
+        crate::license::OFFLINE_LICENSE_USED.load(std::sync::atomic::Ordering::Relaxed),
+        crate::license::OFFLINE_LEASE_STORED.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        command.env("XODUS_OFFLINE_IDENTITY", mode);
     }
     if offline || crate::license::OFFLINE_LICENSE_USED.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("Microsoft is unreachable; skipping PlayFab authorisation (the runtime signs in with its cached identity)");
@@ -1609,5 +1633,15 @@ mod tests {
         std::fs::write(outside.path().join("External.exe"), b"outside").unwrap();
         symlink(outside.path(), root.path().join("External")).unwrap();
         assert!(resolve_package_file(root.path(), "external/EXTERNAL.exe").is_err());
+    }
+
+    #[test]
+    fn the_runtime_offline_identity_follows_the_license_decision() {
+        assert_eq!(offline_identity_mode(true, false), Some("use"));
+        assert_eq!(offline_identity_mode(true, true), Some("use"));
+        assert_eq!(offline_identity_mode(false, true), Some("store"));
+        // Online without an offline lease (not the designated device, or
+        // offline play turned off): the runtime neither uses nor keeps it.
+        assert_eq!(offline_identity_mode(false, false), None);
     }
 }

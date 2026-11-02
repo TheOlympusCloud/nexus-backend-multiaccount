@@ -198,6 +198,8 @@ enum SubCommand {
         set: Option<bool>,
         #[arg(long, default_value_t = false, help = "Acknowledge that Microsoft limits changes and allows one offline PC per account")]
         confirm: bool,
+        #[arg(long = "license-cache", help = "Offline license directory (run --license-cache) to clear when this device is not, or is no longer, designated")]
+        license_cache: Option<String>,
     },
 }
 
@@ -498,8 +500,8 @@ async fn main() -> ExitCode {
             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
         },
         SubCommand::SpLicense { block } => commands::splicense::run(block),
-        SubCommand::OfflinePc { set, confirm } => {
-            commands::offline_pc::run(&client, &tokens, set, confirm).await
+        SubCommand::OfflinePc { set, confirm, license_cache } => {
+            commands::offline_pc::run(&client, &tokens, set, confirm, license_cache.as_deref().map(std::path::Path::new)).await
         }
     };
 

@@ -13,6 +13,11 @@
 //! `{"schema":1,"enabled":bool,"requestSuccess":bool,"remainingToggles":n,
 //!   "maxToggles":n,"periodDays":n,"nextChangeAt":"<RFC 3339>"|null}`
 //! Diagnostics go to stderr as `NEXUS_OFFLINE_PC_V1 <stage> <status>`.
+//!
+//! With `--license-cache` the answer also governs the stored offline
+//! licenses: a status that reads "not designated" and every applied change
+//! remove them all, as the Xbox app requires one launch while online after
+//! designating a device.
 use std::process::ExitCode;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -35,6 +40,7 @@ pub async fn run(
     tokens: &TokenManager,
     set: Option<bool>,
     confirm: bool,
+    license_cache: Option<&std::path::Path>,
 ) -> ExitCode {
     if set.is_some() && !confirm {
         diagnostic("confirm-required", 0);
@@ -120,6 +126,17 @@ pub async fn run(
     };
     diagnostic("ok", status);
     println!("{summary}");
+    if let Some(root) = license_cache
+        && designation_revokes(set, &summary)
+    {
+        match crate::license_cache::LicenseCache::new(root).revoke_all() {
+            Ok(removed) => {
+                eprintln!("Removed {removed} stored offline license(s): this device is not, or is no longer, the designated offline device.");
+                crate::license_cache::diagnostic("content-cache-revoked");
+            }
+            Err(_) => crate::license_cache::diagnostic("content-cache-write-failed"),
+        }
+    }
     // A change Microsoft declined (for example no toggles left) is a failure
     // even though the status was readable.
     if set.is_some() && summary.get("requestSuccess") != Some(&Value::Bool(true)) {
@@ -127,6 +144,13 @@ pub async fn run(
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Whether Microsoft's answer ends the stored offline licenses: the device is
+/// not designated, or the designation changed (either direction starts over).
+fn designation_revokes(set: Option<bool>, summary: &Value) -> bool {
+    let applied = set.is_some() && summary.get("requestSuccess") == Some(&Value::Bool(true));
+    applied || summary.get("enabled") != Some(&Value::Bool(true))
 }
 
 /// Reduces Microsoft's response to the fields Nexus acts on. Dates before
@@ -157,6 +181,21 @@ fn summarize(body: &[u8]) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_offline_licenses_end_when_this_device_is_not_or_no_longer_designated() {
+        let status = |enabled: bool, success: bool| json!({"schema": 1, "enabled": enabled, "requestSuccess": success});
+        // Reading: designated keeps them, anything else revokes (device A after B was designated).
+        assert!(!designation_revokes(None, &status(true, false)));
+        assert!(designation_revokes(None, &status(false, false)));
+        assert!(designation_revokes(None, &json!({"schema": 1})));
+        // Turning offline play off locally revokes; so does turning it on, which needs fresh launches.
+        assert!(designation_revokes(Some(false), &status(false, true)));
+        assert!(designation_revokes(Some(true), &status(true, true)));
+        // A declined change keeps whatever the status says.
+        assert!(!designation_revokes(Some(false), &status(true, false)));
+        assert!(designation_revokes(Some(true), &status(false, false)));
+    }
 
     #[test]
     fn offline_pc_summary_keeps_only_allowlisted_fields_and_drops_the_sentinel_date() {
