@@ -8,6 +8,7 @@ use xodus::tokens::TokenManager;
 
 mod commands;
 mod license;
+mod installation_state;
 mod package;
 mod package_plan;
 #[cfg(feature = "native-webview")]
@@ -123,6 +124,7 @@ enum SubCommand {
         device: bool,
     },
     #[command(about = "Download and extract the game through streaming algorithm")]
+    #[command(after_help = "Nexus capabilities: update-recovery-v1")]
     Streaming {
         source: String,
         destination: String,

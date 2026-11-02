@@ -451,7 +451,11 @@ where
         Err(_) => { eprintln!("The content key could not be authenticated. Retry the installation or sign in again."); return ExitCode::FAILURE; }
     };
 
-    let mut pending = match pending_files(out, &rfiles, &lfiles) {
+    let recovering = match crate::installation_state::incomplete(out) {
+        Ok(value) => value,
+        Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+    };
+    let mut pending = match update::pending(out, &rfiles, &lfiles, recovering) {
         Ok(files) => files,
         Err(error) => { eprintln!("Unable to inspect installed package files: {error}"); return ExitCode::FAILURE; }
     };
@@ -459,7 +463,7 @@ where
         Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
         Err(error) => { eprintln!("Unable to prepare download checkpoints: {error}"); return ExitCode::FAILURE; }
     };
-    let stage = if lfiles.is_empty() { None } else {
+    let stage = if !final_path.exists() && !recovering { None } else {
         match update::staging(out) {
             Ok(stage) => Some(stage),
             Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
@@ -511,6 +515,11 @@ where
         return ExitCode::FAILURE;
     }
 
+    if stage.is_some() {
+        if let Err(error) = update::begin(out, &rfiles, &pending) {
+            failure::report(&error); return ExitCode::FAILURE;
+        }
+    }
     tx.send(ProgressEvent::UpdateRemaining {
         name: "Downloading".to_owned(),
         total: total_size,
@@ -658,7 +667,7 @@ where
     })
     .await
     .ok();
-    if let Err(error) = failure::finalize(&cache_path, &final_path, false) {
+    if let Err(error) = crate::installation_state::finish(out, &cache_path, &final_path) {
         failure::report(&error);
         return ExitCode::FAILURE;
     }

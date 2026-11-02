@@ -550,6 +550,10 @@ pub async fn run(
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
     let out: &Path = Path::new(&source);
+    let _installation_guard = match crate::installation_state::launch_guard(out) {
+        Ok(guard) => guard,
+        Err(error) => { eprintln!("Cannot launch this game: {error}"); return ExitCode::FAILURE; }
+    };
     let out_absolute = std::fs::canonicalize(out).unwrap();
     let final_path = out.join(".xodus-streaming.msixvc");
 

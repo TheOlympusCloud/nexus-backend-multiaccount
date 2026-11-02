@@ -30,6 +30,42 @@ pub(super) fn staging(root: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+pub(super) fn pending<'a>(
+    root: &Path,
+    remote: &'a HashMap<String, SegmentFile>,
+    local: &HashMap<String, SegmentFile>,
+    recovering: bool,
+) -> io::Result<Vec<(&'a String, &'a SegmentFile)>> {
+    let mut files = super::pending_files(root, remote, local)?;
+    if recovering {
+        let queued: std::collections::HashSet<&String> = files.iter().map(|(name, _)| *name).collect();
+        let placeholders = crate::installation_state::placeholders(root)?;
+        // The old final metadata no longer describes every installed file.
+        // If a newer package arrives during recovery, even an apparent revert
+        // to the old metadata must pass the new package's verification again.
+        for (name, file) in remote {
+            if queued.contains(name) { continue; }
+            let path = resume::target(root, name)?;
+            if placeholders.contains(name) && !file.keep_encrypted && file.length > 0 && fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == 0) {
+                continue; // Preserve deliberately uninstalled optional archives.
+            }
+            files.push((name, file));
+        }
+    }
+    Ok(files)
+}
+
+pub(super) fn begin(root: &Path, remote: &HashMap<String, SegmentFile>, pending: &[(&String, &SegmentFile)]) -> io::Result<()> {
+    let queued: std::collections::HashSet<&String> = pending.iter().map(|(name, _)| *name).collect();
+    let mut placeholders = Vec::new();
+    for (name, file) in remote {
+        if queued.contains(name) || file.keep_encrypted || file.length == 0 { continue; }
+        let path = resume::target(root, name)?;
+        if fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == 0) { placeholders.push(name.clone()); }
+    }
+    crate::installation_state::begin_with_placeholders(root, &placeholders)
+}
+
 /// Existing output is reclaimed only after its staged replacement is complete.
 /// Count growth conservatively regardless of download order; never credit hardlinks.
 pub(super) fn required_space<'a>(
@@ -86,6 +122,7 @@ pub(super) fn commit(stage: &Path, root: &Path, name: &str) -> io::Result<()> {
         return Err(io::Error::other("staged output is not a regular file"));
     }
     fs::File::open(&from)?.sync_all()?;
+    crate::installation_state::begin(root)?;
     fs::rename(&from, &to)?;
     fs::File::open(to.parent().unwrap())?.sync_all()?;
     fs::File::open(from.parent().unwrap())?.sync_all()
@@ -101,7 +138,7 @@ pub(super) fn completed(
     journal.offset(name, file.length) == file.length
         && resume::target(root, name)
             .and_then(fs::metadata)
-            .is_ok_and(|m| m.is_file() && m.len() >= file.stored_length().unwrap_or(u64::MAX))
+            .is_ok_and(|m| m.is_file() && m.len() == file.stored_length().unwrap_or(u64::MAX))
 }
 
 pub(super) async fn transfer(
@@ -252,6 +289,24 @@ pub(super) async fn transfer(
 mod tests {
     use super::*;
     #[test]
+    fn streaming_update_completed_never_skips_zero_length_or_oversized_replacements() {
+        let root = tempfile::tempdir().unwrap();
+        let files = HashMap::from([("zero.bin".to_owned(), SegmentFile {
+            offset: 0, length: 0, keep_encrypted: false, data_hashs: vec![],
+        }), ("short.bin".to_owned(), SegmentFile {
+            offset: 4096, length: 3, keep_encrypted: false, data_hashs: vec![],
+        })]);
+        fs::write(root.path().join("zero.bin"), b"must be emptied").unwrap();
+        fs::write(root.path().join("short.bin"), b"new trailing old bytes").unwrap();
+        let mut journal = resume::Journal::open(root.path(), "fixture", &files).unwrap();
+        journal.checkpoint("short.bin", 3).unwrap();
+        for name in ["zero.bin", "short.bin"] { assert!(!completed(&journal, root.path(), name, &files[name])); }
+        fs::write(root.path().join("zero.bin"), []).unwrap();
+        fs::write(root.path().join("short.bin"), b"new").unwrap();
+        for name in ["zero.bin", "short.bin"] { assert!(completed(&journal, root.path(), name, &files[name])); }
+    }
+
+    #[test]
     fn streaming_update_stages_and_commits_without_touching_old_file_until_ready() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -260,9 +315,67 @@ mod tests {
         fs::write(stage.join("game.bin"), b"new valid file").unwrap();
         assert_eq!(fs::read(root.join("game.bin")).unwrap(), b"old valid file");
         commit(&stage, root, "game.bin").unwrap();
+        assert!(crate::installation_state::incomplete(root).unwrap());
         assert_eq!(fs::read(root.join("game.bin")).unwrap(), b"new valid file");
         assert!(!stage.join("game.bin").exists());
         assert!(commit(&stage, root, "../outside").is_err());
+    }
+
+    #[test]
+    fn streaming_update_recovery_rechecks_old_metadata_and_preserves_optional_placeholders() {
+        let root = tempfile::tempdir().unwrap();
+        let file = |length| SegmentFile { offset: 0, length, keep_encrypted: false, data_hashs: vec![[7;20]; 2] };
+        let files = HashMap::from([("game.bin".to_owned(), file(8192)), ("optional.ucas".to_owned(), file(8192))]);
+        fs::write(root.path().join("game.bin"), b"partly replaced game").unwrap();
+        fs::write(root.path().join("optional.ucas"), []).unwrap();
+        assert!(pending(root.path(), &files, &files, false).unwrap().is_empty());
+        begin(root.path(), &files, &[]).unwrap();
+        let recovered = pending(root.path(), &files, &files, true).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].0, "game.bin");
+        assert_eq!(fs::metadata(root.path().join("optional.ucas")).unwrap().len(), 0);
+        // A prior target may have deliberately replaced a full file with an
+        // empty one. A newer target reverting to old metadata must repair it.
+        fs::write(root.path().join("game.bin"), []).unwrap();
+        let recovered = pending(root.path(), &files, &files, true).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].0, "game.bin");
+        // A torn/old-format barrier has no trustworthy placeholder snapshot.
+        fs::write(root.path().join(crate::installation_state::INCOMPLETE), b"{").unwrap();
+        assert_eq!(pending(root.path(), &files, &files, true).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn streaming_update_interrupted_multifile_commit_remains_blocked_until_recovery_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = HashMap::from([("one.bin".to_owned(), SegmentFile {
+            offset: 0, length: 3, keep_encrypted: false, data_hashs: vec![[7;20]],
+        }), ("two.bin".to_owned(), SegmentFile {
+            offset: 4096, length: 3, keep_encrypted: false, data_hashs: vec![[8;20]],
+        })]);
+        for name in files.keys() { fs::write(root.join(name), b"old").unwrap(); }
+        let final_path = root.join(".xodus-streaming.msixvc");
+        let cache = root.join(".xodus-streaming-tmp.msixvc");
+        fs::write(&final_path, b"old metadata").unwrap();
+        let stage = staging(root).unwrap();
+        let mut journal = resume::Journal::open(root, "new version", &files).unwrap();
+        fs::write(stage.join("one.bin"), b"new").unwrap();
+        commit(&stage, root, "one.bin").unwrap();
+        journal.checkpoint("one.bin", 3).unwrap();
+        drop(journal); // Model cancellation/restart after only the first replacement.
+        assert_eq!(fs::read(root.join("one.bin")).unwrap(), b"new");
+        assert_eq!(fs::read(root.join("two.bin")).unwrap(), b"old");
+        assert!(crate::installation_state::launch_guard(root).is_err());
+        let reopened = resume::Journal::open(root, "new version", &files).unwrap();
+        assert!(completed(&reopened, root, "one.bin", &files["one.bin"]));
+        assert!(!completed(&reopened, root, "two.bin", &files["two.bin"]));
+        fs::write(stage.join("two.bin"), b"new").unwrap();
+        commit(&stage, root, "two.bin").unwrap();
+        fs::write(&cache, b"new metadata").unwrap();
+        crate::installation_state::finish(root, &cache, &final_path).unwrap();
+        assert!(crate::installation_state::launch_guard(root).is_ok());
+        assert_eq!(fs::read(root.join("two.bin")).unwrap(), b"new");
     }
     #[test]
     fn streaming_update_rejects_symlinked_stage_and_commit_targets() {
@@ -277,6 +390,37 @@ mod tests {
             .unwrap();
         assert!(commit(&stage, dir.path(), "game.bin").is_err());
         assert!(stage.join("game.bin").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_update_reuses_complete_ciphertext_tail_on_initial_and_resumed_updates() {
+        for offset in [0, PAGE_SIZE as u64] {
+            let root = tempfile::tempdir().unwrap();
+            let bytes = [vec![3u8; PAGE_SIZE], vec![7u8; PAGE_SIZE]].concat();
+            let hashes = bytes.chunks_exact(PAGE_SIZE).map(|page| {
+                let digest = msixvc::streaming::resume_digest(page);
+                std::array::from_fn(|i| u8::from_str_radix(&digest[i * 2..i * 2 + 2], 16).unwrap())
+            }).collect();
+            let file = SegmentFile { offset: 0, length: 5000, keep_encrypted: true, data_hashs: hashes };
+            let installed = root.path().join("installed.exe");
+            fs::write(&installed, &bytes).unwrap();
+            let mut header = vec![0u8; 0x3000];
+            header[512..520].copy_from_slice(b"msft-xvd");
+            header[528..536].copy_from_slice(&116444736000000000u64.to_le_bytes());
+            header[652..656].copy_from_slice(&4u32.to_le_bytes());
+            let xvd = XvdFile::parse(&mut std::io::Cursor::new(header)).await.unwrap();
+            let target = root.path().join("staged.exe");
+            let mut out = tokio::fs::File::create(&target).await.unwrap();
+            out.write_all(&bytes[..offset as usize]).await.unwrap();
+            let (_sender, pause) = watch::channel(false);
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            tokio::time::timeout(std::time::Duration::from_secs(2), transfer(&xvd, &reqwest::Client::new(),
+                "http://127.0.0.1:9/must-not-download", &installed, Some(&file), &file,
+                &mut out, [0;32], offset, pause, &tx, 0, |_| Ok(()))).await.unwrap().unwrap();
+            out.flush().await.unwrap();
+            assert_eq!(fs::read(&target).unwrap(), bytes, "the physical ciphertext tail must not be truncated to 5000 logical bytes");
+            assert_eq!(fs::read(&installed).unwrap(), bytes);
+        }
     }
     #[test]
     fn streaming_update_space_uses_largest_staged_file_not_sum_of_replacements() {
