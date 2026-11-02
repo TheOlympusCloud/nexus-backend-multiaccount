@@ -184,7 +184,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         begin(root.path()).unwrap();
         let result = crate::commands::run::run(&reqwest::Client::new(), &xodus::tokens::TokenManager::with_memory(),
-            root.path().to_string_lossy().into_owned(), "/must-not-run".into(), None, false, false, None).await;
+            root.path().to_string_lossy().into_owned(), "/must-not-run".into(), None, false, false, None, None, false).await;
         assert_eq!(result, std::process::ExitCode::FAILURE);
     }
 

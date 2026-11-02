@@ -27,9 +27,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use xodus::licensing::content::{lease_policy, parse_lease};
+use xodus::licensing::offline_integrity;
 use xodus::models::devicecredential::{License, LicenseType};
 
-const SCHEMA: u64 = 3;
+const SCHEMA: u64 = 4;
 const MAX_FILE_BYTES: u64 = 160 * 1024;
 const MAX_BLOCK_CHARS: usize = 48 * 1024;
 const MAX_LEASE_CHARS: usize = 96 * 1024;
@@ -111,12 +112,20 @@ pub fn check_lease(document: &str, key: &License, issued_at: u64, now: u64) -> L
         return LeaseCheck::Invalid("no-expiry");
     };
     let mut until = expires_at as u64;
-    if let Some(expiration) = lease.license_info.expiration_date.as_deref() {
-        let Some(expiration) = lease_time(expiration) else {
-            eprintln!("Unrecognised lease expiration date format: {}.", date_shape(expiration));
-            return LeaseCheck::Invalid("expiration-date");
-        };
-        until = until.min(expiration.max(0) as u64);
+    // The lease cannot extend the underlying key's validity (for example a
+    // trial) or start before either server-issued validity window begins.
+    for info in [&lease.license_info, &key.license_info] {
+        if let Some(begin) = info.begin_date.as_deref() {
+            let Some(begin) = lease_time(begin) else { return LeaseCheck::Invalid("begin-date"); };
+            if begin > now as i64 { return LeaseCheck::Invalid("not-yet-valid"); }
+        }
+        if let Some(expiration) = info.expiration_date.as_deref() {
+            let Some(parsed) = lease_time(expiration) else {
+                eprintln!("Unrecognised lease expiration date format: {}.", date_shape(expiration));
+                return LeaseCheck::Invalid("expiration-date");
+            };
+            until = until.min(parsed.max(0) as u64);
+        }
     }
     until = until.min(issued_at.saturating_add(MAX_OFFLINE_SECONDS));
     if until <= now {
@@ -173,15 +182,35 @@ pub enum Unusable {
     Clock,
 }
 
-pub struct LicenseCache {
+pub struct LicenseCache<'a> {
     root: PathBuf,
+    secret: Option<&'a [u8]>,
 }
 
-impl LicenseCache {
+impl<'a> LicenseCache<'a> {
     pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
+            secret: None,
         }
+    }
+
+    pub fn authenticated(root: &Path, secret: &'a [u8]) -> Self {
+        Self { root: root.to_path_buf(), secret: Some(secret) }
+    }
+
+    fn seal(&self, value: &mut Value) -> Result<(), String> {
+        value.as_object_mut().ok_or_else(cache_io_error)?.remove("integrity");
+        let tag = offline_integrity::seal(self.secret.ok_or_else(cache_io_error)?, value.to_string().as_bytes())
+            .ok_or_else(cache_io_error)?;
+        value["integrity"] = json!(tag);
+        Ok(())
+    }
+
+    fn authentic(&self, value: &mut Value) -> bool {
+        let Some(object) = value.as_object_mut() else { return false; };
+        let Some(Value::String(tag)) = object.remove("integrity") else { return false; };
+        self.secret.is_some_and(|secret| offline_integrity::verify(secret, value.to_string().as_bytes(), &tag))
     }
 
     fn entry_path(&self, content_id: &str) -> Result<PathBuf, String> {
@@ -201,6 +230,9 @@ impl LicenseCache {
     }
 
     fn ensure_root(&self) -> std::io::Result<()> {
+        if fs::symlink_metadata(&self.root).is_ok_and(|metadata| !metadata.is_dir()) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
@@ -212,10 +244,7 @@ impl LicenseCache {
     }
 
     fn owner(&self) -> Option<Holder> {
-        let bytes = fs::read(self.root.join(OWNER_FILE)).ok()?;
-        if bytes.len() > 4096 {
-            return None;
-        }
+        let bytes = read_bounded(&self.root.join(OWNER_FILE), 4096).ok()?;
         let value: Value = serde_json::from_slice(&bytes).ok()?;
         Some(Holder {
             puid: value.get("puid")?.as_str()?.to_string(),
@@ -226,6 +255,15 @@ impl LicenseCache {
     /// Removes every stored license (and the owner record). Returns how many
     /// licenses were removed.
     pub fn revoke_all(&self) -> Result<usize, String> {
+        match fs::symlink_metadata(&self.root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Ok(metadata) if metadata.is_dir() => {},
+            _ => return Err(cache_io_error()),
+        }
+        // Revocation survives partial deletion and process exit. It grants
+        // nothing and is removed only once every previous entry is gone.
+        let revoked = self.root.join(".revoked");
+        write_atomic(&revoked, b"revoked\n")?;
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -246,13 +284,15 @@ impl LicenseCache {
                 Err(_) => failed = true,
             }
         }
-        if failed { Err(cache_io_error()) } else { Ok(removed) }
+        if failed { return Err(cache_io_error()); }
+        fs::remove_file(revoked).map_err(|_| cache_io_error())?;
+        Ok(removed)
     }
 
     /// Licenses another account or device registration left behind are never
     /// used; they are removed before this holder's are read or written.
     fn claim(&self, holder: &Holder) -> Result<bool, String> {
-        if self.owner().as_ref() == Some(holder) {
+        if self.owner().as_ref() == Some(holder) && !self.root.join(".revoked").exists() {
             return Ok(false);
         }
         let removed = self.revoke_all()?;
@@ -274,6 +314,7 @@ impl LicenseCache {
         leases: &[String],
         now: u64,
     ) -> Result<Stored, String> {
+        self.ensure_root().map_err(|_| cache_io_error())?;
         let path = self.entry_path(content_id)?;
         if self.claim(holder)? {
             diagnostic("content-cache-account");
@@ -305,7 +346,7 @@ impl LicenseCache {
             remove_quietly(&path);
             return Err("The content license block is not cacheable.".to_string());
         }
-        let entry = json!({
+        let mut entry = json!({
             "schema": SCHEMA,
             "contentId": content_id.to_ascii_lowercase(),
             "puid": holder.puid,
@@ -318,9 +359,14 @@ impl LicenseCache {
                 "deviceId": key.binding.device_id,
                 "leaseRequired": key.binding.lease_required,
             },
+            "keyValidity": {
+                "beginDate": key.license_info.begin_date,
+                "expirationDate": key.license_info.expiration_date,
+            },
             "lease": lease,
             "splicenseBlock": key.splicense_block,
         });
+        self.seal(&mut entry)?;
         write_atomic(&path, entry.to_string().as_bytes())?;
         Ok(Stored::Saved)
     }
@@ -335,12 +381,18 @@ impl LicenseCache {
         now: u64,
     ) -> Result<Result<CachedLicense, Unusable>, String> {
         let path = self.entry_path(content_id)?;
+        if fs::symlink_metadata(&self.root).is_ok_and(|metadata| !metadata.is_dir()) { return Err(cache_io_error()); }
+        match fs::symlink_metadata(self.root.join(".revoked")) {
+            Ok(_) => return Ok(Err(Unusable::Invalid)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(_) => return Err(cache_io_error()),
+        }
         if self.owner().is_some_and(|owner| owner != *holder) {
             self.revoke_all()?;
             diagnostic("content-cache-account");
             return Ok(Err(Unusable::Account));
         }
-        let metadata = match fs::metadata(&path) {
+        let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 diagnostic("content-cache-missing");
@@ -351,10 +403,11 @@ impl LicenseCache {
         if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
             return Ok(Self::invalid(&path));
         }
-        let bytes = fs::read(&path).map_err(|_| cache_io_error())?;
+        let bytes = read_bounded(&path, MAX_FILE_BYTES).map_err(|_| cache_io_error())?;
         let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
             return Ok(Self::invalid(&path));
         };
+        if !self.authentic(&mut value) { return Ok(Self::invalid(&path)); }
         let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
         let number = |key: &str| value.get(key).and_then(Value::as_u64);
         let (Some(block), Some(lease), Some(issued_at), Some(last_used_at)) =
@@ -400,6 +453,7 @@ impl LicenseCache {
         // Record the use so a later clock change cannot move behind it. A use
         // that cannot be recorded is not granted.
         value["lastUsedAt"] = json!(last_used_at.max(now));
+        self.seal(&mut value)?;
         write_atomic(&path, value.to_string().as_bytes())?;
         Ok(Ok(CachedLicense {
             splicense_block: block,
@@ -428,6 +482,7 @@ impl LicenseCache {
 fn stored_key(value: &Value, block: &str) -> Option<License> {
     use xodus::models::devicecredential::{Binding, LicenseInfo};
     let binding = value.get("keyBinding")?;
+    let validity = value.get("keyValidity")?;
     let text = |key: &str| binding.get(key).and_then(Value::as_str).map(str::to_string);
     Some(License {
         splicense_block: block.to_string(),
@@ -437,8 +492,8 @@ fn stored_key(value: &Value, block: &str) -> Option<License> {
             license_category: None,
             issued_date: None,
             last_updated_date: None,
-            begin_date: None,
-            expiration_date: None,
+            begin_date: validity.get("beginDate").and_then(Value::as_str).map(str::to_string),
+            expiration_date: validity.get("expirationDate").and_then(Value::as_str).map(str::to_string),
         },
         custom_policies: None,
         binding: Binding {
@@ -463,30 +518,34 @@ fn remove_quietly(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    write_private(&temporary, bytes).map_err(|_| cache_io_error())?;
-    if fs::rename(&temporary, path).is_err() {
-        remove_quietly(&temporary);
-        return Err(cache_io_error());
+fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
     }
-    Ok(())
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit { return Err(std::io::ErrorKind::InvalidData.into()); }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit { return Err(std::io::ErrorKind::InvalidData.into()); }
+    Ok(bytes)
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    let parent = path.parent().ok_or_else(cache_io_error)?;
+    // A fresh private file avoids following a stale or malicious .tmp link.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| cache_io_error())?;
+    temporary.write_all(bytes).map_err(|_| cache_io_error())?;
+    temporary.as_file().sync_all().map_err(|_| cache_io_error())?;
+    temporary.persist(path).map_err(|_| cache_io_error())?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    fs::File::open(parent).and_then(|directory| directory.sync_all()).map_err(|_| cache_io_error())?;
+    Ok(())
 }
 
 #[cfg(test)]

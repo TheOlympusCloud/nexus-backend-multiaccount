@@ -111,7 +111,7 @@ pub async fn get_license(
         Ok(license) => {
             let material = license_material(tokens, &license.key.splicense_block)?;
             if let Some(root) = cache {
-                record_license(root, &content_id, holder.as_ref(), &market, &license, unix_now());
+                record_license(tokens, root, &content_id, holder.as_ref(), &market, &license, unix_now());
             }
             Ok(material)
         }
@@ -123,6 +123,7 @@ pub async fn get_license(
 /// stored; a key license that is not device-bound means this device is not
 /// the account's designated offline device, so every stored license ends.
 pub fn record_license(
+    tokens: &TokenManager,
     root: &Path,
     content_id: &str,
     holder: Option<&Holder>,
@@ -178,7 +179,11 @@ pub fn record_license(
         diagnostic("content-cache-skipped");
         return;
     };
-    match cache.store(content_id, holder, market, &license.key, &license.lease_documents, now) {
+    let Ok(device) = tokens.get_device_license() else {
+        diagnostic("content-cache-skipped");
+        return;
+    };
+    match LicenseCache::authenticated(root, device.password.as_bytes()).store(content_id, holder, market, &license.key, &license.lease_documents, now) {
         Ok(Stored::Saved) => {
             OFFLINE_LEASE_STORED.store(true, Ordering::Relaxed);
             diagnostic("content-cache-stored")
@@ -230,7 +235,8 @@ pub fn recover_offline(
                     "{message} No device registration is stored, so no offline license can be used. Sign in again while online."
                 ));
             };
-            match LicenseCache::new(root).load(content_id, holder, now) {
+            let device = tokens.get_device_license().map_err(|_| "Stored device registration is unavailable. Sign in again while online.".to_string())?;
+            match LicenseCache::authenticated(root, device.password.as_bytes()).load(content_id, holder, now) {
                 Ok(Ok(entry)) => {
                     OFFLINE_LICENSE_USED.store(true, Ordering::Relaxed);
                     diagnostic("content-cache-used");
@@ -456,6 +462,14 @@ mod tests {
         assert_eq!(tokens.get_device_license().unwrap().hwid, "unchanged");
     }
 
+    fn offline_test_tokens() -> TokenManager {
+        let tokens = TokenManager::with_memory();
+        tokens.save_device_license(&Device { username: "synthetic".into(), password: "unused".into(),
+            puid: "unused".into(), hwid: "unused".into(), device_id: "device-a".into(),
+            splicense: BASE64_STANDARD.encode([0u8; 8]) }).unwrap();
+        tokens
+    }
+
     use crate::license_cache::tests::{DAY, holder, key, lease_with, offline_lease, rfc3339};
 
     /// A structurally valid, empty SPLicense: header and offset only. Using it
@@ -482,11 +496,11 @@ mod tests {
 
     #[test]
     fn the_designated_device_stores_its_offline_lease_and_uses_it_only_while_unreachable() {
-        let tokens = TokenManager::with_memory();
+        let tokens = offline_test_tokens();
         let root = tempfile::tempdir().unwrap();
         let now = 1_800_000_000;
         let device_a = holder("puid", "device-a");
-        record_license(root.path(), "content-a", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
+        record_license(&tokens, root.path(), "content-a", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
         assert!(root.path().join("content-a.json").exists());
         assert!(OFFLINE_LEASE_STORED.load(Ordering::Relaxed));
 
@@ -512,16 +526,16 @@ mod tests {
 
     #[test]
     fn switching_the_designation_from_a_to_b_ends_offline_play_on_a_when_it_reconnects() {
-        let tokens = TokenManager::with_memory();
+        let tokens = offline_test_tokens();
         let root = tempfile::tempdir().unwrap();
         let now = 1_800_000_000;
         let device_a = holder("puid", "device-a");
         for content in ["content-a", "content-b"] {
-            record_license(root.path(), content, Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
+            record_license(&tokens, root.path(), content, Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
         }
         // The account designates device B. Device A reconnects and launches any
         // game: Microsoft now issues it a User-bound key and no offline lease.
-        record_license(root.path(), "content-c", Some(&device_a), "US", &issued("User", vec![]), now + 2 * DAY);
+        record_license(&tokens, root.path(), "content-c", Some(&device_a), "US", &issued("User", vec![]), now + 2 * DAY);
         for content in ["content-a", "content-b", "content-c"] {
             assert!(!root.path().join(format!("{content}.json")).exists(), "{content}");
         }
@@ -530,21 +544,21 @@ mod tests {
         assert!(error.contains("No valid offline license is stored"), "{error}");
 
         // A Machine-bound key without an offline lease keeps the other games but not this one.
-        record_license(root.path(), "content-d", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
-        record_license(root.path(), "content-e", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
+        record_license(&tokens, root.path(), "content-d", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
+        record_license(&tokens, root.path(), "content-e", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
         let online = lease_with(&format!("{{\"isOffline\":false,\"expiresAt\":\"{}\"}}", rfc3339(now + DAY)), "synthetic-device", None);
-        record_license(root.path(), "content-e", Some(&device_a), "US", &issued("Machine", vec![online]), now);
+        record_license(&tokens, root.path(), "content-e", Some(&device_a), "US", &issued("Machine", vec![online]), now);
         assert!(root.path().join("content-d.json").exists());
         assert!(!root.path().join("content-e.json").exists());
     }
 
     #[test]
     fn expired_leases_fail_closed_and_disappear() {
-        let tokens = TokenManager::with_memory();
+        let tokens = offline_test_tokens();
         let root = tempfile::tempdir().unwrap();
         let now = 1_800_000_000;
         let device_a = holder("puid", "device-a");
-        record_license(root.path(), "content-a", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 2 * DAY)]), now);
+        record_license(&tokens, root.path(), "content-a", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 2 * DAY)]), now);
         let error = recover_offline(&tokens, Some(root.path()), "content-a", Some(&device_a), unreachable(), now + 2 * DAY).err().unwrap();
         assert!(error.contains("offline license is stored"), "{error}");
         assert!(!root.path().join("content-a.json").exists());
@@ -552,11 +566,11 @@ mod tests {
 
     #[test]
     fn an_account_change_removes_every_stored_license() {
-        let tokens = TokenManager::with_memory();
+        let tokens = offline_test_tokens();
         let root = tempfile::tempdir().unwrap();
         let now = 1_800_000_000;
         let first = holder("puid-a", "device-a");
-        record_license(root.path(), "content-a", Some(&first), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
+        record_license(&tokens, root.path(), "content-a", Some(&first), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
         let error = recover_offline(&tokens, Some(root.path()), "content-a", Some(&holder("puid-b", "device-a")), unreachable(), now + DAY).err().unwrap();
         assert!(error.contains("offline license is stored"), "{error}");
         assert!(!root.path().join("content-a.json").exists());
@@ -566,12 +580,12 @@ mod tests {
 
     #[test]
     fn explicit_licensing_refusals_remove_stored_licenses() {
-        let tokens = TokenManager::with_memory();
+        let tokens = offline_test_tokens();
         let root = tempfile::tempdir().unwrap();
         let now = 1_800_000_000;
         let device_a = holder("puid", "device-a");
         for content in ["content-a", "content-b", "content-c"] {
-            record_license(root.path(), content, Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
+            record_license(&tokens, root.path(), content, Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
         }
         // Not entitled to one game: only that game's license goes.
         let error = recover_offline(&tokens, Some(root.path()), "content-a", Some(&device_a),
@@ -584,7 +598,7 @@ mod tests {
             content_failure(LicenseContentError::Forbidden), now).err().unwrap();
         assert!(!root.path().join("content-b.json").exists());
         // The Store refuses this device: nothing stored on it may be used.
-        record_license(root.path(), "content-b", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
+        record_license(&tokens, root.path(), "content-b", Some(&device_a), "US", &issued("Machine", vec![offline_lease(now + 30 * DAY)]), now);
         let error = recover_offline(&tokens, Some(root.path()), "content-a", Some(&device_a),
             content_failure(LicenseContentError::DeviceLimit), now).err().unwrap();
         assert!(error.contains("device limit"), "{error}");
@@ -597,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn offline_launch_never_contacts_microsoft_and_uses_only_the_stored_license() {
-        let tokens = TokenManager::with_memory();
+        let tokens = offline_test_tokens();
         tokens
             .save_user(&xodus::models::secrets::User { puid: "puid".into(), username: "user@example.com".into() })
             .unwrap();
@@ -613,7 +627,7 @@ mod tests {
             .unwrap();
         let root = tempfile::tempdir().unwrap();
         let now = unix_now();
-        record_license(root.path(), "content-a", Some(&holder("puid", "device:device-a")), "US", &issued("Machine", vec![offline_lease(now + 20 * DAY)]), now);
+        record_license(&tokens, root.path(), "content-a", Some(&holder("puid", "device:device-a")), "US", &issued("Machine", vec![offline_lease(now + 20 * DAY)]), now);
         // Any request would have to connect within a millisecond and fail: the
         // offline path must never issue one.
         let client = reqwest::ClientBuilder::new()
