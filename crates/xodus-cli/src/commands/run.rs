@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -67,6 +67,11 @@ impl LaunchView {
     fn path(&self) -> &Path {
         self.dir.path()
     }
+
+    fn inherit_into(&self, command: &mut std::process::Command) -> std::io::Result<()> {
+        if let Some(lock) = &self._lock { lock.inherit_into(command)?; }
+        Ok(())
+    }
 }
 
 struct LaunchViewLock {
@@ -78,7 +83,7 @@ impl LaunchViewLock {
     fn acquire(path: &Path) -> std::io::Result<Self> {
         Self::acquire_with(path, |file| {
             let flags = fcntl_getfd(file)?;
-            fcntl_setfd(file, flags - FdFlags::CLOEXEC)?;
+            fcntl_setfd(file, flags | FdFlags::CLOEXEC)?;
             Ok(())
         })
     }
@@ -92,6 +97,23 @@ impl LaunchViewLock {
         prepare(staging.as_file())?;
         let file = staging.persist_noclobber(path).map_err(|error| error.error)?;
         Ok(Self { path: path.to_path_buf(), _file: file })
+    }
+
+    fn inherit_into(&self, command: &mut std::process::Command) -> std::io::Result<()> {
+        // An owned CLOEXEC duplicate keeps the descriptor valid until spawn.
+        // Only this command's child clears the flag; concurrent helper programs
+        // must not retain a game session's workspace lock.
+        let file = self._file.try_clone()?;
+        unsafe {
+            command.pre_exec(move || {
+                // Only fcntl syscalls and errno conversion after fork. No
+                // allocation, logging, locks, environment reads or keyring I/O.
+                let flags = fcntl_getfd(&file)?;
+                fcntl_setfd(&file, flags - FdFlags::CLOEXEC)?;
+                Ok(())
+            });
+        }
+        Ok(())
     }
 }
 
@@ -147,8 +169,10 @@ impl DlcMountWorkspace {
         Ok(Self { view: Some(view), windows_path })
     }
 
-    fn configure(&self, command: &mut Command) {
+    fn configure(&self, command: &mut Command) -> std::io::Result<()> {
+        if let Some(view) = &self.view { view.inherit_into(command.as_std_mut())?; }
         command.env(MOUNT_WORKSPACE_ENV, &self.windows_path);
+        Ok(())
     }
 }
 
@@ -1025,8 +1049,19 @@ pub async fn run(
         .env("WINE_DLL_FILE_MAP", env_value)
         .env("WINE_EXE_FILE_MAP", exe_env_value);
     command.env_remove(MOUNT_WORKSPACE_ENV);
-    if let Some(workspace) = &mount_workspace {
-        workspace.configure(&mut command);
+    let inherit_views = (|| -> std::io::Result<()> {
+        if let Some(view) = &launch_mirror { view.inherit_into(command.as_std_mut())?; }
+        if let Some(workspace) = &mount_workspace { workspace.configure(&mut command)?; }
+        Ok(())
+    })();
+    if let Err(error) = inherit_views {
+        eprintln!("could not attach launch workspace to Wine: {error}");
+        drop(command);
+        let _ = std::fs::remove_file(&stub_path);
+        drop(mount_workspace);
+        drop(launch_mirror);
+        cleanup().await;
+        return ExitCode::FAILURE;
     }
     if offline {
         // The runtime treats the network as unreachable at once instead of
@@ -1056,7 +1091,9 @@ pub async fn run(
         }
     }
 
-    let mut wn = match command.spawn() {
+    let spawned = command.spawn();
+    drop(command); // Release parent copies retained by pre_exec closures.
+    let mut wn = match spawned {
         Ok(child) => child,
         Err(err) => {
             eprintln!("failed to start Wine: {}", err);
@@ -1105,17 +1142,72 @@ mod tests {
         assert!(mount_workspace_marker_matches(&view._lock.as_ref().unwrap()._file, &std::fs::metadata(view.path()).unwrap()));
         let mut command = Command::new("true");
         command.env(MOUNT_WORKSPACE_ENV, "inherited/foreign");
-        workspace.configure(&mut command);
+        workspace.configure(&mut command).unwrap();
         let value = command.as_std().get_envs().find(|(key, _)| *key == MOUNT_WORKSPACE_ENV).unwrap().1.unwrap();
         assert_eq!(value, std::ffi::OsStr::new(&format!("Z:{}", view.path().to_str().unwrap().replace('/', "\\"))));
+        drop(command);
         let path = view.path().to_path_buf();
         std::fs::write(path.join("readonly.bin"), b"copied").unwrap();
         std::fs::set_permissions(path.join("readonly.bin"), std::fs::Permissions::from_mode(0o444)).unwrap();
         symlink(&game, path.join("outside")).unwrap();
         drop(workspace);
+        // Another parallel fixture may be between fork and exec, before its
+        // CLOEXEC descriptors close. Keep that transient holder safe, then
+        // require the normal stale-view sweep to remove the workspace.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() && std::time::Instant::now() < deadline {
+            sweep_stale_launch_views(root.path());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(!path.exists());
         assert!(!launch_view_lock_path(&path).exists());
         assert_eq!(std::fs::read(game.join("keep.bin")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn dlc_workspace_unrelated_child_does_not_keep_workspace_alive() {
+        use std::io::BufRead;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = DlcMountWorkspace::new(&root.path().join("game")).unwrap();
+        let path = workspace.view.as_ref().unwrap().path().to_path_buf();
+        let mut intended = std::process::Command::new("true");
+        workspace.view.as_ref().unwrap().inherit_into(&mut intended).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "printf 'ready\\n'; read -r line"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        drop(intended);
+        drop(workspace);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() && std::time::Instant::now() < deadline {
+            sweep_stale_launch_views(root.path());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let retained = path.exists();
+        child.stdin.take().unwrap().write_all(b"done\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(!retained, "an unrelated executable inherited the game workspace lock");
+    }
+
+    #[test]
+    fn dlc_workspace_failed_launch_releases_owned_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = DlcMountWorkspace::new(&root.path().join("game")).unwrap();
+        let path = workspace.view.as_ref().unwrap().path().to_path_buf();
+        let mut command = std::process::Command::new(root.path().join("does-not-exist"));
+        workspace.view.as_ref().unwrap().inherit_into(&mut command).unwrap();
+        assert!(command.spawn().is_err());
+        drop(command);
+        drop(workspace);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() && std::time::Instant::now() < deadline {
+            sweep_stale_launch_views(root.path());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!path.exists() && !launch_view_lock_path(&path).exists());
     }
 
     #[test]
@@ -1124,9 +1216,13 @@ mod tests {
         let workspace = DlcMountWorkspace::new(&root.path().join("game")).unwrap();
         let path = workspace.view.as_ref().unwrap().path().to_path_buf();
         std::fs::write(path.join("content.bin"), b"private DLC").unwrap();
-        let mut child = std::process::Command::new("sh").args(["-c", "read -r line"])
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "read -r line"])
             .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()).spawn().unwrap();
+            .stderr(std::process::Stdio::null());
+        workspace.view.as_ref().unwrap().inherit_into(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        drop(command);
         drop(workspace);
         assert!(path.exists() && launch_view_lock_path(&path).exists());
         assert_eq!(sweep_stale_launch_views(root.path()), 0);
@@ -1334,7 +1430,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let view = launch_view_directory(&root.path().join("game"), ".xodus-chain-").unwrap();
         let lock = view._lock.as_ref().unwrap();
-        assert!(!fcntl_getfd(&lock._file).unwrap().contains(FdFlags::CLOEXEC));
+        assert!(fcntl_getfd(&lock._file).unwrap().contains(FdFlags::CLOEXEC));
+        // The descendant-lifetime fixture verifies explicit child inheritance.
     }
 
     #[test]
@@ -1513,10 +1610,11 @@ mod tests {
     #[ignore = "subprocess fixture for launch-view lock inheritance"]
     fn launch_view_process_fixture() {
         let root = PathBuf::from(std::env::var_os("NEXUS_LAUNCH_VIEW_TEST_ROOT").unwrap());
-        let _view = launch_view_directory(&root.join("game"), ".xodus-chain-").unwrap();
-        let status = std::process::Command::new("sh")
-            .args(["-c", "printf 'VIEW_CHILD_READY\\n'; read -r release"])
-            .status().unwrap();
+        let view = launch_view_directory(&root.join("game"), ".xodus-chain-").unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf 'VIEW_CHILD_READY\\n'; read -r release"]);
+        view.inherit_into(&mut command).unwrap();
+        let status = command.status().unwrap();
         assert!(status.success());
     }
 
