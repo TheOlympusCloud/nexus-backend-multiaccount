@@ -175,6 +175,13 @@ enum SubCommand {
         market: Option<String>,
         #[arg(long = "license-cache", help = "Directory for device-bound offline licenses (--license-cache) used when Microsoft is unreachable")]
         license_cache: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            requires = "license_cache",
+            help = "Launch on the stored offline license without contacting Microsoft (the launcher sets this once it finds Microsoft unreachable)"
+        )]
+        offline: bool,
     },
     #[command(about = "Generate or decrypt base64-encoded CLEP challenge data")]
     Clep {
@@ -322,10 +329,31 @@ async fn main() -> ExitCode {
             | SubCommand::SpLicense { .. }
             | SubCommand::Logout { .. }
     );
-    if needs_device_credentials {
+    // An offline launch never contacts Microsoft: the stored device license
+    // and the stored offline content license are all it uses.
+    #[cfg(unix)]
+    let offline_launch = matches!(args.command, SubCommand::Run { offline: true, .. });
+    #[cfg(not(unix))]
+    let offline_launch = false;
+    // A launch with an offline license cache may outlive the device token
+    // (it expires while the device is offline). Renewal needs Microsoft, so a
+    // failed renewal must not end the launch before the content-license step,
+    // which still decides: only an unreachable Microsoft lets the stored
+    // offline license stand in, a refusal fails as before.
+    #[cfg(unix)]
+    let launch_with_license_cache = matches!(args.command, SubCommand::Run { license_cache: Some(_), .. });
+    #[cfg(not(unix))]
+    let launch_with_license_cache = false;
+    if needs_device_credentials && !offline_launch {
         if let Err(error) = xodus::tokens::device::ensure_device_credentials(&client, &tokens).await {
-            error.report();
-            return ExitCode::FAILURE;
+            if launch_with_license_cache && tokens.get_device_license().is_ok() {
+                eprintln!(
+                    "Device credential renewal failed; continuing with the stored device license. If Microsoft is unreachable, the offline license stored on this device is used."
+                );
+            } else {
+                error.report();
+                return ExitCode::FAILURE;
+            }
         }
     }
 
@@ -446,6 +474,7 @@ async fn main() -> ExitCode {
             materialize_chain,
             market,
             license_cache,
+            offline,
         } => {
             commands::run::run(
                 &client,
@@ -457,6 +486,7 @@ async fn main() -> ExitCode {
                 materialize_chain,
                 market,
                 license_cache,
+                offline,
             )
             .await
         }

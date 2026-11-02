@@ -430,6 +430,7 @@ where
         market.unwrap_or("neutral".to_string()),
         // Downloads stay online-only; offline licenses are for launching installed games.
         None,
+        false,
     )
     .await;
     if let Err(err) = license {

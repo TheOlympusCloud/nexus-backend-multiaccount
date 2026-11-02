@@ -40,15 +40,32 @@ pub struct OnlineLicense {
 
 /// Fetches the content license online. `cache` enables device-bound offline
 /// use: a license that arrives with an offline lease is recorded there and
-/// consulted only when Microsoft is unreachable.
+/// consulted only when Microsoft is unreachable. `offline` states that the
+/// caller already found Microsoft unreachable: no request is made and only
+/// the stored license can satisfy the launch.
 pub async fn get_license(
     client: &reqwest::Client,
     tokens: &TokenManager,
     content_id: String,
     market: String,
     cache: Option<&Path>,
+    offline: bool,
 ) -> std::result::Result<(DeviceKey, SPLicense), String> {
     let user = tokens.get_user().map_err(|error| error.to_string())?;
+    if offline {
+        // Skip the ticket and license requests and their connect timeouts;
+        // the stored license is held to the same rules as after a failed
+        // request, so nothing is granted that an unreachable Microsoft would
+        // not have allowed.
+        return recover_offline(
+            tokens,
+            cache,
+            &content_id,
+            &user.puid,
+            OnlineFailure::Unreachable("Microsoft is unreachable (offline launch requested).".to_string()),
+            unix_now(),
+        );
+    }
     match fetch_online(client, tokens, &user, content_id.clone(), market.clone()).await {
         Ok(license) => {
             let material = license_material(tokens, &license.key.splicense_block)?;
@@ -454,6 +471,49 @@ mod tests {
             now + crate::license_cache::MAX_OFFLINE_SECONDS).err().unwrap();
         assert!(error.contains("offline license is stored"), "{error}");
         assert!(!root.path().join("content-a.json").exists());
+    }
+
+    #[tokio::test]
+    async fn offline_launch_never_contacts_microsoft_and_uses_only_the_stored_license() {
+        let tokens = TokenManager::with_memory();
+        tokens
+            .save_user(&xodus::models::secrets::User { puid: "puid".into(), username: "user@example.com".into() })
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let block = BASE64_STANDARD.encode([0u8; 8]);
+        let now = unix_now();
+        LicenseCache::new(root.path())
+            .store("content-a", "puid", "US", &synthetic(&block, None), Some(now + 20 * 24 * 60 * 60), now)
+            .unwrap();
+        // Any request would have to connect within a millisecond and fail: the
+        // offline path must never issue one.
+        let client = reqwest::ClientBuilder::new()
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+
+        // The stored block is accepted and the flow proceeds to the device key,
+        // exactly as after a failed request.
+        let error = get_license(&client, &tokens, "content-a".into(), "US".into(), Some(root.path()), true)
+            .await
+            .err()
+            .unwrap();
+        assert!(!error.contains("offline launch requested"), "{error}");
+        assert!(root.path().join("content-a.json").exists());
+        assert!(OFFLINE_LICENSE_USED.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Without a stored license the launch fails closed and says why.
+        let error = get_license(&client, &tokens, "content-b".into(), "US".into(), Some(root.path()), true)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.starts_with("Microsoft is unreachable (offline launch requested)."), "{error}");
+        assert!(error.contains("No valid offline license is stored"), "{error}");
+        let error = get_license(&client, &tokens, "content-a".into(), "US".into(), None, true)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.starts_with("Microsoft is unreachable (offline launch requested)."), "{error}");
     }
 
     #[test]

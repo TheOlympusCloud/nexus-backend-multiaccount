@@ -709,6 +709,7 @@ pub async fn run(
     materialize_chain: bool,
     market: Option<String>,
     license_cache: Option<String>,
+    offline: bool,
 ) -> ExitCode {
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
@@ -763,6 +764,7 @@ pub async fn run(
         xvd.content_id().to_string(),
         market.unwrap_or("neutral".to_string()),
         license_cache.as_deref(),
+        offline,
     )
     .await;
     if let Err(err) = license {
@@ -916,7 +918,13 @@ pub async fn run(
         .arg(&stub_path)
         .env("WINE_DLL_FILE_MAP", env_value)
         .env("WINE_EXE_FILE_MAP", exe_env_value);
-    if crate::license::OFFLINE_LICENSE_USED.load(std::sync::atomic::Ordering::Relaxed) {
+    if offline {
+        // The runtime treats the network as unreachable at once and completes
+        // the Xbox sign-in from its cached identity instead of waiting for
+        // its own connect timeouts (xuser-offline-identity-v1).
+        command.env("XODUS_FORCE_OFFLINE", "1");
+    }
+    if offline || crate::license::OFFLINE_LICENSE_USED.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("Microsoft is unreachable; skipping PlayFab authorisation (the runtime signs in with its cached identity)");
     } else {
         match playfab_auth_header(client, tokens).await {
