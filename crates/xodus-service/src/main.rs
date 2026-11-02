@@ -10,7 +10,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 use xodus::tokens::TokenManager;
 
 mod connection;
+mod account_metadata;
 mod simple_context;
+mod store_license;
+mod store_updates;
 mod utils;
 
 const XML_MAGIC: u32 = 0x58445358;
@@ -38,16 +41,30 @@ async fn main() {
         registry.init();
     }
 
-    xodus::secrets::init_secrets().expect("Failed to init keychain");
+    if let Err(error) = xodus::secrets::init_secrets() {
+        xodus::tokens::store::TokenStoreError::from(error).report();
+        std::process::exit(1);
+    }
     let tokens = Arc::new(TokenManager::with_keychain_and_memory());
-    xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
-    let xodus::models::secrets::Token::Legacy(device_token) =
-        tokens.get_device_sts_token().unwrap()
-    else {
-        panic!("Device token isnt legacy")
+    if let Err(error) =
+        xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await
+    {
+        error.report();
+        std::process::exit(1);
+    }
+    let xodus::models::secrets::Token::Legacy(device_token) = (match tokens.get_device_sts_token() {
+        Ok(token) => token,
+        Err(error) => {
+            error.report();
+            std::process::exit(1);
+        }
+    }) else {
+        xodus::tokens::store::TokenStoreError::DeviceAuthentication.report();
+        std::process::exit(1);
     };
 
     let runtime_dir = utils::get_runtime_dir();
+    let context = simple_context::SimpleContext::new(device_token, tokens);
     let cancellation = CancellationToken::new();
     let socket_path = format!("{runtime_dir}/xodus.sock");
     let trigger = cancellation.clone();
@@ -70,10 +87,9 @@ async fn main() {
             .expect("Failed to accept");
 
             let token = cancellation.clone();
-            let device_token = device_token.clone();
-            let tokens = tokens.clone();
+            let context = context.clone();
             tokio::spawn(async move {
-                connection::router::route(accept.0, token, device_token, tokens).await
+                connection::router::route(accept.0, token, context).await
             });
         }
     }

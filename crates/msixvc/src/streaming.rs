@@ -11,7 +11,41 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 const UPSTREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
 
-type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+#[cfg(test)]
+#[path = "streaming_metadata_tests.rs"]
+mod metadata_tests;
+
+/// Stable digest used for package identity and durable download checkpoints.
+pub fn resume_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Incremental checkpoint identity digest. Callers can serialize large layouts
+/// through a bounded buffer instead of materializing their entire JSON encoding.
+#[derive(Default)]
+pub struct ResumeDigest(sha2::Sha256);
+
+impl std::io::Write for ResumeDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+impl ResumeDigest {
+    pub fn finish(self) -> String {
+        use sha2::Digest;
+        self.0.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 type PendingHttpOpen = Pin<Box<dyn Future<Output = std::io::Result<OpenedHttpStream>> + Send>>;
 
 struct ActiveHttpStream {
@@ -47,8 +81,13 @@ impl<'t> HttpRead<'t> {
     where
         Progress: FnMut(u64, u64) + Send + 't,
     {
+        Self::open_with_policy(client, url, progress, crate::streaming_http::Policy::default()).await
+    }
+
+    async fn open_with_policy<Progress>(client: reqwest::Client, url: impl Into<String>, progress: Option<Progress>, policy: crate::streaming_http::Policy) -> std::io::Result<Self>
+    where Progress: FnMut(u64, u64) + Send + 't {
         let url = url.into();
-        let initial = open_http_stream(client.clone(), url.clone(), None).await?;
+        let initial = open_http_stream_with_policy(client.clone(), url.clone(), None, policy).await?;
 
         Ok(Self {
             client,
@@ -182,16 +221,13 @@ impl<'t> AsyncRead for HttpRead<'t> {
                     self.pending_chunk = Some(chunk);
                     self.pending_chunk_offset = 0;
                 }
-                Poll::Ready(Some(Err(_err))) => {
-                    self.active = None;
-                    continue;
-                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
                 Poll::Ready(None) => {
                     self.active = None;
                     if self.pos >= self.len {
                         return Poll::Ready(Ok(()));
                     }
-                    continue;
+                    return Poll::Ready(Err(Error::new(ErrorKind::UnexpectedEof, "Package metadata transfer ended early.")));
                 }
             }
         }
@@ -210,6 +246,7 @@ enum CacheWriteState {
     Idle,
     Seeking { offset: u64 },
     Writing,
+    Flushing,
 }
 
 pub struct PrefixCacheFile<R> {
@@ -399,18 +436,32 @@ where
                         }
                         Poll::Ready(Ok(written)) => {
                             self.pending_chunk_offset += written;
-                            self.cached_len += written as u64;
                             self.cache_write_pos += written as u64;
                             if self.pending_chunk_offset >= chunk.len() {
-                                self.pending_chunk = None;
-                                self.pending_chunk_offset = 0;
-                                self.cache_write_state = CacheWriteState::Idle;
+                                // Tokio's File::poll_write returns when it has queued the
+                                // blocking write, before another file handle can read it.
+                                // Publish cached_len only after that write has completed.
+                                self.cache_write_state = CacheWriteState::Flushing;
+                                continue;
                             }
                             return Poll::Ready(Ok(()));
                         }
                         Poll::Ready(Err(err)) => {
                             self.cache_write_state = CacheWriteState::Idle;
                             return Poll::Ready(Err(err));
+                        }
+                    }
+                }
+                CacheWriteState::Flushing => {
+                    match AsyncWrite::poll_flush(Pin::new(&mut self.cache_writer), cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                        Poll::Ready(Ok(())) => {
+                            self.cached_len = self.cache_write_pos;
+                            self.pending_chunk = None;
+                            self.pending_chunk_offset = 0;
+                            self.cache_write_state = CacheWriteState::Idle;
+                            return Poll::Ready(Ok(()));
                         }
                     }
                 }
@@ -503,6 +554,12 @@ where
                 Poll::Pending => return Poll::Pending,
             }
 
+            // Flushing may already satisfy this read. Do not park an unnecessary
+            // upstream future that can retain the shared bandwidth limiter.
+            if self.cached_len >= target_end {
+                continue;
+            }
+
             match self.as_mut().poll_fill_from_upstream(cx) {
                 Poll::Ready(Ok(true)) => continue,
                 Poll::Ready(Ok(false)) => {
@@ -568,17 +625,45 @@ async fn open_http_stream(
     url: String,
     start: Option<u64>,
 ) -> std::io::Result<OpenedHttpStream> {
-    let mut request = client.get(url);
+    open_http_stream_with_policy(client, url, start, crate::streaming_http::Policy::default()).await
+}
+
+async fn open_http_stream_with_policy(
+    client: reqwest::Client, url: String, start: Option<u64>, policy: crate::streaming_http::Policy,
+) -> std::io::Result<OpenedHttpStream> {
+    use crate::streaming_http::{RangeReader, TransferError};
+    use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
+    let mut attempt = 0u32;
+    let started = tokio::time::Instant::now();
+    let response = loop {
+    let mut request = client.get(&url).header(ACCEPT_ENCODING, "identity");
     if let Some(start) = start {
         request = request.header(RANGE, format!("bytes={start}-"));
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(http_err)?
-        .error_for_status()
-        .map_err(http_err)?;
+    let remaining = policy.budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() { return Err(Error::other(TransferError::new("metadata-headers-timeout", 0))); }
+    let result = tokio::time::timeout(policy.timeout.min(remaining), request.send()).await;
+    let error = match result {
+        Ok(Ok(response)) if response.status().is_success() => break response,
+        Ok(Ok(response)) => {
+            let status = response.status().as_u16();
+            let error = TransferError::new("metadata-http", status);
+            if !matches!(status, 408 | 500 | 502 | 503 | 504) { return Err(Error::other(error)); }
+            error
+        }
+        Ok(Err(error)) => TransferError::new(if error.is_timeout() { "metadata-headers-timeout" } else { "metadata-request" }, 0),
+        Err(_) => TransferError::new("metadata-headers-timeout", 0),
+    };
+    if attempt >= policy.retries { return Err(Error::other(error)); }
+    let delay = policy.backoff.saturating_mul(1 << attempt.min(4));
+    if delay >= policy.budget.saturating_sub(started.elapsed()) { return Err(Error::other(error)); }
+    tokio::time::sleep(delay).await;
+    attempt += 1;
+    };
+    if response.headers().get(CONTENT_ENCODING).is_some_and(|value| value != "identity") {
+        return Err(Error::other(TransferError::new("metadata-encoding", response.status().as_u16())));
+    }
 
     let (actual_start, len) = match start {
         None => {
@@ -636,15 +721,15 @@ async fn open_http_stream(
         }
     };
 
+    let reader = RangeReader::from_response(&client, &url, actual_start, len, response, policy);
+    let stream = futures_util::stream::try_unfold(reader, |mut reader| async move {
+        reader.next().await.map(|bytes| bytes.map(|bytes| (bytes, reader))).map_err(Error::other)
+    });
     Ok(OpenedHttpStream {
         start: actual_start,
         len,
-        stream: Box::pin(response.bytes_stream()),
+        stream: Box::pin(stream),
     })
-}
-
-fn http_err(err: reqwest::Error) -> std::io::Error {
-    Error::other(err)
 }
 
 #[cfg(test)]
@@ -875,6 +960,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_large_prefix_is_visible_to_reader() {
+        let body: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let server = spawn_server(body.clone(), None, 0).await.unwrap();
+        let cache = cache_path("large-prefix");
+        let mut file = open_cached_reader(&server, &cache).await;
+
+        let offset = 6 * 1024 * 1024;
+        file.seek(SeekFrom::Start(offset)).await.unwrap();
+        let mut tail = [0u8; 4096];
+        file.read_exact(&mut tail).await.unwrap();
+        assert_eq!(
+            &tail[..],
+            &body[offset as usize..offset as usize + tail.len()]
+        );
+
+        file.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut head = [0u8; 4096];
+        file.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[..], &body[..head.len()]);
+        let _ = std::fs::remove_file(cache);
+    }
+
+    #[tokio::test]
     async fn cached_reader_resumes_http_source() {
         let body = test_body();
         let server = spawn_server(body.clone(), Some(96), 0).await.unwrap();
@@ -888,7 +996,7 @@ mod tests {
         let ranges = server.request_ranges();
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0], None);
-        assert_eq!(ranges[1].as_deref(), Some("bytes=96-"));
+        assert_eq!(ranges[1].as_deref(), Some("bytes=96-16383"));
         let _ = std::fs::remove_file(cache);
     }
 
@@ -900,7 +1008,7 @@ mod tests {
 
         let mut buf = [0u8; 256];
         let err = file.read_exact(&mut buf).await.unwrap_err();
-        assert!(err.to_string().contains("range resume mismatch"));
+        assert!(err.to_string().contains("transfer-range"));
         let _ = std::fs::remove_file(cache);
     }
 }

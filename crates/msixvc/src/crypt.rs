@@ -1,8 +1,6 @@
 use crate::layout::PAGE_SIZE;
 use crate::models::xvd::XvcRegionId;
 
-use std::iter;
-
 use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt};
 use aes::{Aes128Dec, Aes128Enc, Block};
 use uuid::Uuid;
@@ -72,7 +70,7 @@ const fn gf_mul_x(n: u128) -> u128 {
 /// Each 16-byte block is transformed as `out = transform(in ⊕ T) ⊕ T`, where `T` is the
 /// AES-encrypted tweak, advanced by one GF(2¹²⁸) multiplication per block.
 ///
-/// The `transform` function is called with each block after the tweak is applied, and should
+/// The `transform` function receives independent blocks after their tweaks are applied, and should
 /// perform either AES encryption or decryption.
 #[inline]
 fn transform_page_xts<F>(
@@ -81,26 +79,30 @@ fn transform_page_xts<F>(
     tweak_cipher: &Aes128Enc,
     transform: F,
 ) where
-    F: Fn(&mut Block),
+    F: Fn(&mut [Block]),
 {
     // XTS requires the data length to be a multiple of the block size (16 bytes).
     const { assert!(PAGE_SIZE.is_multiple_of(16)) };
 
-    // Every tweak in the iterator is calculated by applying `gf_mul_x` to the previous one.
-    let tweaks = iter::successors(Some(tweak.encrypt(tweak_cipher)), |t| Some(gf_mul_x(*t)));
-
-    for (block, tweak) in page.as_chunks_mut::<16>().0.iter_mut().zip(tweaks) {
-        let mut out = u128::from_le_bytes(*block);
-
-        out ^= tweak;
-        out = {
-            let mut buf = Array(out.to_le_bytes());
-            transform(&mut buf);
-            u128::from_le_bytes(buf.0)
-        };
-        out ^= tweak;
-
-        *block = out.to_le_bytes();
+    // Let the AES backend interleave independent blocks instead of paying the
+    // dispatch and AES-round dependency cost once per 16 bytes. A fixed stack
+    // batch keeps memory bounded and leaves CPU feature selection to `aes`.
+    const BLOCKS: usize = 8;
+    const { assert!(PAGE_SIZE.is_multiple_of(16 * BLOCKS)) };
+    let mut next_tweak = tweak.encrypt(tweak_cipher);
+    for chunk in page.chunks_exact_mut(16 * BLOCKS) {
+        let mut blocks = [Block::default(); BLOCKS];
+        let mut tweaks = [0u128; BLOCKS];
+        for (i, input) in chunk.chunks_exact(16).enumerate() {
+            tweaks[i] = next_tweak;
+            blocks[i] =
+                Array((u128::from_le_bytes(input.try_into().unwrap()) ^ next_tweak).to_le_bytes());
+            next_tweak = gf_mul_x(next_tweak);
+        }
+        transform(&mut blocks);
+        for (i, output) in chunk.chunks_exact_mut(16).enumerate() {
+            output.copy_from_slice(&(u128::from_le_bytes(blocks[i].0) ^ tweaks[i]).to_le_bytes());
+        }
     }
 }
 
@@ -116,7 +118,7 @@ pub fn encrypt_page_xts(
     data_cipher: &Aes128Enc,
 ) {
     transform_page_xts(page, tweak, tweak_cipher, |block| {
-        data_cipher.encrypt_block(block);
+        data_cipher.encrypt_blocks(block);
     });
 }
 
@@ -132,7 +134,7 @@ pub fn decrypt_page_xts(
     data_cipher: &Aes128Dec,
 ) {
     transform_page_xts(page, tweak, tweak_cipher, |block| {
-        data_cipher.decrypt_block(block);
+        data_cipher.decrypt_blocks(block);
     });
 }
 
@@ -222,5 +224,106 @@ mod tests {
         encrypt_page_xts(&mut page2, tweak2, &tweak_cipher, &data_cipher_enc);
 
         assert_ne!(page1, page2);
+    }
+    #[test]
+    #[ignore = "local CPU benchmark, not Internet bandwidth"]
+    fn xts_page_decryption_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        let tweak = TweakGenerator::new(TEST_REGION_ID, TEST_VDUID).with_data_unit(TEST_DATA_UNIT);
+        let tweak_cipher = Aes128Enc::new(TEST_TWEAK_CIPHER);
+        let cipher = Aes128Dec::new(TEST_DATA_CIPHER);
+        let mut page = TEST_PAGE;
+        for sample in 0..3 {
+            let start = Instant::now();
+            for _ in 0..32768 {
+                decrypt_page_xts(
+                    black_box(&mut page),
+                    black_box(tweak),
+                    black_box(&tweak_cipher),
+                    black_box(&cipher),
+                );
+            }
+            let seconds = start.elapsed().as_secs_f64();
+            black_box(page);
+            eprintln!(
+                "XTS_CPU_BENCH sample={sample} bytes={} seconds={seconds:.6} MiBps={:.2}",
+                32768 * PAGE_SIZE,
+                128.0 / seconds
+            );
+        }
+    }
+
+    #[test]
+    fn batched_xts_matches_scalar_reference_for_keys_units_and_both_directions() {
+        fn scalar(
+            page: &mut [u8; PAGE_SIZE],
+            tweak: Tweak,
+            key: &Aes128Enc,
+            transform: impl Fn(&mut Block),
+        ) {
+            let mut value = tweak.encrypt(key);
+            for bytes in page.chunks_exact_mut(16) {
+                let mut block =
+                    Array((u128::from_le_bytes(bytes.try_into().unwrap()) ^ value).to_le_bytes());
+                transform(&mut block);
+                bytes.copy_from_slice(&(u128::from_le_bytes(block.0) ^ value).to_le_bytes());
+                value = gf_mul_x(value);
+            }
+        }
+        for seed in 0..64u8 {
+            let tweak_key =
+                Aes128Enc::new(&Array(std::array::from_fn(|i| seed.wrapping_add(i as u8))));
+            let data_key = Array(std::array::from_fn(|i| {
+                seed.wrapping_mul(7).wrapping_add(i as u8)
+            }));
+            let enc = Aes128Enc::new(&data_key);
+            let dec = Aes128Dec::new(&data_key);
+            let tweak = TweakGenerator::new(
+                XvcRegionId::Other(seed as u32),
+                Uuid::from_bytes([seed; 16]),
+            )
+            .with_data_unit(u32::MAX.wrapping_sub(seed as u32));
+            let plain = std::array::from_fn(|i| (i as u8).wrapping_mul(19).wrapping_add(seed));
+            let mut expected = plain;
+            scalar(&mut expected, tweak, &tweak_key, |block| {
+                enc.encrypt_block(block)
+            });
+            let mut actual = plain;
+            encrypt_page_xts(&mut actual, tweak, &tweak_key, &enc);
+            assert_eq!(actual, expected);
+            scalar(&mut expected, tweak, &tweak_key, |block| {
+                dec.decrypt_block(block)
+            });
+            decrypt_page_xts(&mut actual, tweak, &tweak_key, &dec);
+            assert_eq!(actual, expected);
+            assert_eq!(actual, plain);
+        }
+    }
+
+    #[test]
+    fn xts_ciphertext_matches_independent_openssl_vector() {
+        use sha2::{Digest, Sha256};
+        // AES-128-XTS EVP, data key [22;16], tweak key [178;16], plaintext [146;4096].
+        // IV is LE data unit67 + region1 + the first8 VDUUID bytes [222;8].
+        let mut page = TEST_PAGE;
+        let tweak = TweakGenerator::new(TEST_REGION_ID, TEST_VDUID).with_data_unit(TEST_DATA_UNIT);
+        let tweak_cipher = Aes128Enc::new(TEST_TWEAK_CIPHER);
+        encrypt_page_xts(
+            &mut page,
+            tweak,
+            &tweak_cipher,
+            &Aes128Enc::new(TEST_DATA_CIPHER),
+        );
+        assert_eq!(
+            Sha256::digest(page).iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "48dd83893608258ed7488c31c38dd6f6a94e7207d9b3c96eef7acde342b18f92"
+        );
+        decrypt_page_xts(
+            &mut page,
+            tweak,
+            &tweak_cipher,
+            &Aes128Dec::new(TEST_DATA_CIPHER),
+        );
+        assert_eq!(page, TEST_PAGE);
     }
 }

@@ -8,11 +8,46 @@ use xodus::tokens::TokenManager;
 
 mod commands;
 mod license;
+mod license_cache;
+mod installation_state;
 mod package;
+mod package_plan;
+#[cfg(feature = "native-webview")]
+mod webview;
+#[cfg(not(feature = "native-webview"))]
+#[path = "webview_stdio.rs"]
 mod webview;
 
 #[derive(Subcommand)]
 enum SubCommand {
+    #[cfg(target_os = "linux")]
+    #[command(about = "Gracefully stop only a Nexus-owned session keyring without accessing credentials")]
+    KeyringSessionStop {
+        #[arg(long)]
+        provider_pid: u32,
+    },
+    #[cfg(target_os = "linux")]
+    #[command(about = "Create the first default wallet using the provider's password dialog")]
+    KeyringCreate {
+        #[arg(long, default_value = "")]
+        window_id: String,
+    },
+    #[cfg(target_os = "linux")]
+    #[command(about = "Unlock the default system wallet without reading credentials or signing in")]
+    KeyringUnlock {
+        #[arg(long, default_value = "")]
+        window_id: String,
+    },
+    #[command(about = "Resolve public Store packages without sign-in or downloading")]
+    ResolvePackage {
+        product: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "US")]
+        market: String,
+        #[arg(long, help = "Include parent-bound PC Durable packages for managed DLC installation")]
+        include_dlc: bool,
+    },
     #[command(about = "Download msixvc or xsp files fo given game")]
     Download {
         product: String,
@@ -50,15 +85,70 @@ enum SubCommand {
         #[arg(short, long, help = "Path to a keyfile with content decryption keys")]
         key_file: Option<String>,
     },
+    #[command(about = "Show whether Xodus has a stored Microsoft account")]
+    Account {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    #[command(about = "Read Xbox gamertag and gamerpic for the stored account")]
+    Profile {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    #[command(about = "Extended native Nexus social services") ]
+    NativeSocial {
+        #[command(subcommand)]
+        action: commands::native_social::Action,
+    },
+    #[command(about = "Explicit Xbox friends and text chat, JSON request on standard input")]
+    Social {
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    #[command(about = "Read Xbox time played and last activity for one title without starting sign-in")]
+    GameActivity {
+        title_id: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Read achievements for one Xbox title without signing in or unlocking anything")]
+    Achievements {
+        title_id: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Read account product entitlements without starting sign-in")]
+    Library {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value = "US")]
+        market: String,
+    },
     Login,
     Logout {
         #[arg(long, default_value_t = false, help = "Remove device license")]
         device: bool,
     },
     #[command(about = "Download and extract the game through streaming algorithm")]
+    #[command(after_help = "Nexus capabilities: update-recovery-v1")]
     Streaming {
         source: String,
         destination: String,
+        #[arg(long, help = "Content ID explicitly selected from resolve-package for this Store product")]
+        selected_content_id: Option<String>,
+        #[arg(
+            long,
+            help = "Emit Nexus progress protocol v1 as newline-delimited JSON"
+        )]
+        progress_json: bool,
+        #[arg(
+            long,
+            requires = "progress_json",
+            help = "Accept pause/resume JSON commands on stdin"
+        )]
+        control_stdin: bool,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=1_048_576), help = "Aggregate download bandwidth in KiB/s, 0 for unlimited; accepts live set-download-limit stdin control")]
+        download_limit_kib: u32,
         #[arg(
             long,
             default_value_t = false,
@@ -77,8 +167,21 @@ enum SubCommand {
         wine: String,
         #[arg(short, long)]
         exe: Option<String>,
+        #[arg(long, default_value_t = false)]
+        materialize_exe: bool,
+        #[arg(long, default_value_t = false)]
+        materialize_chain: bool,
         #[arg(short, long)]
         market: Option<String>,
+        #[arg(long = "license-cache", help = "Directory for device-bound offline licenses (--license-cache) used when Microsoft is unreachable")]
+        license_cache: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            requires = "license_cache",
+            help = "Launch on the stored offline license without contacting Microsoft (the launcher sets this once it finds Microsoft unreachable)"
+        )]
+        offline: bool,
     },
     #[command(about = "Generate or decrypt base64-encoded CLEP challenge data")]
     Clep {
@@ -88,6 +191,15 @@ enum SubCommand {
     #[command(about = "Decode SPLicenseBlock")]
     SpLicense {
         block: String,
+    },
+    #[command(about = "Show or change whether this device is the account's designated offline PC (JSON on stdout)")]
+    OfflinePc {
+        #[arg(long, help = "Designate (true) or undesignate (false) this device; requires --confirm")]
+        set: Option<bool>,
+        #[arg(long, default_value_t = false, help = "Acknowledge that Microsoft limits changes and allows one offline PC per account")]
+        confirm: bool,
+        #[arg(long = "license-cache", help = "Offline license directory (run --license-cache) to clear when this device is not, or is no longer, designated")]
+        license_cache: Option<String>,
     },
 }
 
@@ -118,6 +230,9 @@ enum ClepAction {
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct CliArgs {
+    #[cfg(not(feature = "native-webview"))]
+    #[arg(long, help = "Use Nexus external sign-in UI protocol version 1 on private stdio")]
+    external_webview_stdio: bool,
     #[command(subcommand)]
     command: SubCommand,
 }
@@ -126,7 +241,7 @@ struct CliArgs {
 async fn main() -> ExitCode {
     let filter = tracing_subscriber::EnvFilter::from_env("XODUS_LOG");
     let registry =
-        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
+        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(filter));
 
     #[cfg(feature = "tokio_console")]
     {
@@ -143,14 +258,58 @@ async fn main() -> ExitCode {
     {
         registry.init();
     }
+    // Connects are bounded so an unreachable Microsoft is detected in seconds
+    // (offline launches then fall back to the stored license at once); no
+    // overall request timeout, because this client also streams game data.
     let client = reqwest::ClientBuilder::new()
         .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
         .connection_verbose(true)
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();
     let args = CliArgs::parse();
+    #[cfg(target_os = "linux")]
+    if let SubCommand::KeyringSessionStop { provider_pid } = &args.command {
+        let state = xodus::keyring_session::stop_session_provider(*provider_pid);
+        println!("{}", serde_json::json!({"schema": 1, "state": state.as_str()}));
+        return if state == xodus::keyring_session::StopState::Unavailable { ExitCode::FAILURE } else { ExitCode::SUCCESS };
+    }
+    #[cfg(target_os = "linux")]
+    if let SubCommand::KeyringUnlock { window_id } | SubCommand::KeyringCreate { window_id } = &args.command {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let state = if ctrlc::set_handler(move || { signal.store(true, Ordering::SeqCst); }).is_err() {
+            xodus::keyring_unlock::UnlockState::Unavailable
+        } else {
+            if matches!(&args.command, SubCommand::KeyringCreate { .. }) {
+                xodus::keyring_unlock::create_default(window_id, &cancelled)
+            } else {
+                xodus::keyring_unlock::unlock_default(window_id, &cancelled)
+            }
+        };
+        println!("{}", serde_json::json!({"schema": 1, "state": state.as_str()}));
+        return ExitCode::SUCCESS;
+    }
+    #[cfg(not(feature = "native-webview"))]
+    if args.external_webview_stdio {
+        webview::enable_stdio();
+    }
 
-    xodus::secrets::init_secrets().expect("Unable to initialize credentials");
+    // Public preflight must not activate a keyring, provision a device or sign in.
+    if let SubCommand::ResolvePackage { product, json: _, market, include_dlc } = &args.command {
+        return match package_plan::resolve(&client, &product.to_uppercase(), &market.to_uppercase()).await {
+            Ok(plan) => {
+                let plan = if *include_dlc { plan } else { plan.without_durable_selection() };
+                println!("{}", plan.json(&product.to_uppercase(), &market.to_uppercase())); ExitCode::SUCCESS
+            },
+            Err(error) => { eprintln!("{error}"); ExitCode::FAILURE },
+        };
+    }
+    if let Err(error) = xodus::secrets::init_secrets() {
+        xodus::tokens::store::TokenStoreError::from(error).report();
+        return ExitCode::FAILURE;
+    }
     let tokens = TokenManager::with_keychain_and_memory();
 
     // Clep/SpLicense are pure local data transforms and Logout only removes
@@ -161,13 +320,53 @@ async fn main() -> ExitCode {
     // these fully offline commands were unusable.
     let needs_device_credentials = !matches!(
         args.command,
-        SubCommand::Clep { .. } | SubCommand::SpLicense { .. } | SubCommand::Logout { .. }
+        SubCommand::Account { .. }
+            | SubCommand::Profile { .. }
+            | SubCommand::Social { .. }
+            | SubCommand::NativeSocial { .. }
+            | SubCommand::GameActivity { .. }
+            | SubCommand::Achievements { .. }
+            | SubCommand::Library { .. }
+            | SubCommand::Clep { .. }
+            | SubCommand::SpLicense { .. }
+            | SubCommand::Logout { .. }
     );
-    if needs_device_credentials {
-        xodus::tokens::device::ensure_device_credentials(&client, &tokens).await;
+    // An offline launch never contacts Microsoft: the stored device license
+    // and the stored offline content license are all it uses.
+    #[cfg(unix)]
+    let offline_launch = matches!(args.command, SubCommand::Run { offline: true, .. });
+    #[cfg(not(unix))]
+    let offline_launch = false;
+    // A launch with an offline license cache may outlive the device token
+    // (it expires while the device is offline). Renewal needs Microsoft, so a
+    // failed renewal must not end the launch before the content-license step,
+    // which still decides: only an unreachable Microsoft lets the stored
+    // offline license stand in, a refusal fails as before.
+    #[cfg(unix)]
+    let launch_with_license_cache = matches!(args.command, SubCommand::Run { license_cache: Some(_), .. });
+    #[cfg(not(unix))]
+    let launch_with_license_cache = false;
+    if needs_device_credentials && !offline_launch {
+        if let Err(error) = xodus::tokens::device::ensure_device_credentials(&client, &tokens).await {
+            if launch_with_license_cache && tokens.get_device_license().is_ok() {
+                eprintln!(
+                    "Device credential renewal failed; continuing with the stored device license. If Microsoft is unreachable, the offline license stored on this device is used."
+                );
+            } else {
+                error.report();
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     let code = match args.command {
+        #[cfg(target_os = "linux")]
+        SubCommand::KeyringSessionStop { .. } => unreachable!(),
+        #[cfg(target_os = "linux")]
+        SubCommand::KeyringUnlock { .. } => unreachable!(),
+        #[cfg(target_os = "linux")]
+        SubCommand::KeyringCreate { .. } => unreachable!(),
+        SubCommand::ResolvePackage { .. } => unreachable!(),
         SubCommand::Download {
             product,
             market,
@@ -187,6 +386,40 @@ async fn main() -> ExitCode {
             )
             .await
         }
+        SubCommand::Library { json, market } => commands::library::run(&tokens, json, market).await,
+        SubCommand::Account { json } => match tokens.get_user() {
+            Ok(user) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "stored": true,
+                            "username": user.username,
+                        })
+                    );
+                } else {
+                    println!("{}", user.username);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(xodus::tokens::store::TokenStoreError::NotFound) => {
+                if json {
+                    println!("{}", serde_json::json!({ "stored": false }));
+                } else {
+                    println!("No stored Microsoft account");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Unable to read the stored account: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        SubCommand::Profile { json } => commands::profile::run(&tokens, json).await,
+        SubCommand::NativeSocial { action } => commands::native_social::run(&tokens,action).await,
+        SubCommand::Social { .. } => commands::social::run(&tokens).await,
+        SubCommand::GameActivity { title_id, json } => commands::game_activity::run(&tokens, title_id, json).await,
+        SubCommand::Achievements { title_id, json } => commands::achievements::run(&tokens, title_id, json).await,
         SubCommand::Login => commands::login::run(&client, &tokens).await,
         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
         SubCommand::Extract {
@@ -211,10 +444,15 @@ async fn main() -> ExitCode {
         SubCommand::Streaming {
             source,
             destination,
+            selected_content_id,
+            progress_json,
+            control_stdin,
+            download_limit_kib,
             try_skip_ntfs,
             market,
             parallel,
         } => {
+            msixvc::bandwidth::set_limit_kib(download_limit_kib);
             commands::streaming::run(
                 &client,
                 &tokens,
@@ -223,6 +461,9 @@ async fn main() -> ExitCode {
                 try_skip_ntfs,
                 parallel,
                 market,
+                progress_json,
+                control_stdin,
+                selected_content_id,
             )
             .await
         }
@@ -231,8 +472,26 @@ async fn main() -> ExitCode {
             source,
             wine,
             exe,
+            materialize_exe,
+            materialize_chain,
             market,
-        } => commands::run::run(&client, &tokens, source, wine, exe, market).await,
+            license_cache,
+            offline,
+        } => {
+            commands::run::run(
+                &client,
+                &tokens,
+                source,
+                wine,
+                exe,
+                materialize_exe,
+                materialize_chain,
+                market,
+                license_cache,
+                offline,
+            )
+            .await
+        }
         SubCommand::Clep { action } => match action {
             ClepAction::Generate {
                 smbios,
@@ -241,6 +500,9 @@ async fn main() -> ExitCode {
             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
         },
         SubCommand::SpLicense { block } => commands::splicense::run(block),
+        SubCommand::OfflinePc { set, confirm, license_cache } => {
+            commands::offline_pc::run(&client, &tokens, set, confirm, license_cache.as_deref().map(std::path::Path::new)).await
+        }
     };
 
     xodus::secrets::destroy_secrets();

@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "version": "0.2.15",
+  "repository": "domsvoboda/nexus-backend",
+  "upstream": {
+    "repository": "https://github.com/xodus-gaming/xodus.git",
+    "commit": "53ea781dcd073e31d7ea68e894134e9c959bff04"
+  },
+  "rust": "1.99.0",
+  "cargoLockSha256": "5bb0002af6fca499ca230869e5053341ca06bf8dad869f0e3bc77325eda60825",
+  "compatibility": "linux-run-v25",
+  "authUi": "electron"
+}

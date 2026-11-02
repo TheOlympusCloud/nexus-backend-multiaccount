@@ -10,13 +10,71 @@ use crate::models::soap;
 mod rst;
 mod utils;
 
+/// Fixed diagnostic categories, never error text, XML, keys or account data.
+pub fn exchange_failure_stage(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    use rst::RSTError;
+    Some(match error.downcast_ref::<RSTError>()? {
+        RSTError::Request(_) => return None,
+        RSTError::Serialization(_) | RSTError::Builder(_) => "ticket-request-build",
+        RSTError::Deserialization(_) => "ticket-response-parse",
+        RSTError::InvalidResponseSignature(_) => "ticket-response-signature",
+        _ => "ticket-response-crypto",
+    })
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn ticket_diagnostic_classifies_without_disclosing_error_payloads() {
+        let xml = quick_xml::de::from_str::<soap::Envelope>("<private-email-secret>").unwrap_err();
+        assert_eq!(exchange_failure_stage(&rst::RSTError::Deserialization(xml)), Some("ticket-response-parse"));
+        assert_eq!(exchange_failure_stage(&rst::RSTError::InvalidResponseSignature("private-email-secret".into())), Some("ticket-response-signature"));
+        assert_eq!(exchange_failure_stage(&rst::RSTError::MissingNonce), Some("ticket-response-crypto"));
+        assert_eq!(exchange_failure_stage(&std::io::Error::other("private-email-secret")), None);
+    }
+}
+
 pub const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
+
+#[derive(Debug, thiserror::Error)]
+pub enum DeviceCredentialError {
+    #[error("Microsoft device registration request failed.")]
+    Transport(#[from] reqwest::Error),
+    #[error("Microsoft returned an invalid device registration response.")]
+    InvalidResponse,
+}
+
+const DEVICE_RESPONSE_LIMIT: usize = 1024 * 1024;
+
+async fn device_credential_response(response: reqwest::Response) -> Result<DeviceAddResponse, DeviceCredentialError> {
+    let mut response = response.error_for_status()?;
+    if response.content_length().is_some_and(|length| length > DEVICE_RESPONSE_LIMIT as u64) {
+        return Err(DeviceCredentialError::InvalidResponse);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > DEVICE_RESPONSE_LIMIT {
+            return Err(DeviceCredentialError::InvalidResponse);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = std::str::from_utf8(&body).map_err(|_| DeviceCredentialError::InvalidResponse)?;
+    let parsed: DeviceAddResponse = quick_xml::de::from_str(text).map_err(|_| DeviceCredentialError::InvalidResponse)?;
+    if !parsed.success || parsed.puid.is_empty() || parsed.license.splicense_block.is_empty() {
+        return Err(DeviceCredentialError::InvalidResponse);
+    }
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod device_response_tests;
 
 pub async fn login_device_credential(
     client: &reqwest::Client,
     data: DeviceAddRequest,
-) -> reqwest::Result<DeviceAddResponse> {
-    let data = quick_xml::se::to_string(&data).unwrap();
+) -> Result<DeviceAddResponse, DeviceCredentialError> {
+    let data = quick_xml::se::to_string(&data).map_err(|_| DeviceCredentialError::InvalidResponse)?;
 
     let response = client
         .post("https://login.live.com/ppsecure/deviceaddcredential.srf")
@@ -26,9 +84,7 @@ pub async fn login_device_credential(
         .body(data)
         .send()
         .await?;
-    let text = response.text().await?;
-    let resp: DeviceAddResponse = quick_xml::de::from_str(&text).expect("Failed to de xml");
-    Ok(resp)
+    device_credential_response(response).await
 }
 
 pub async fn authenticate_device(
@@ -52,8 +108,8 @@ pub async fn exchange_device_token(
     scope: String,
     policy: Option<soap::PolicyReference>,
 ) -> Result<soap::RequestSecurityTokenResponse, rst::RSTError> {
-    let secret = BASE64_STANDARD.decode(token.binary_secret.as_ref().unwrap())?;
-    let secret: [u8; 4096] = secret.try_into().unwrap();
+    let secret = BASE64_STANDARD.decode(token.binary_secret.as_ref().ok_or(rst::RSTError::InvalidEncryptedPayload)?)?;
+    let secret: [u8; 4096] = secret.try_into().map_err(|_| rst::RSTError::InvalidEncryptedPayload)?;
     let secret: ClepHmacState = transmute!(secret);
     let hmac_secret = secret.get_hmac_state();
 
@@ -73,10 +129,10 @@ pub async fn exchange_device_token(
     match envelope.body.body {
         soap::BodyContent::RequestSecurityTokenResponse(res) => Ok(*res),
         soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection) => {
-            let token = collection.security_tokens.remove(0);
+            let token = collection.security_tokens.drain(..).next().ok_or(rst::RSTError::InvalidEncryptedPayload)?;
             Ok(token)
         }
-        b => unimplemented!("Exchange token supports only singular token right now {b:?}"),
+        _ => Err(rst::RSTError::InvalidEncryptedPayload),
     }
 }
 
@@ -93,8 +149,8 @@ pub async fn exchange_user_token(
     hosting_app: String,
     scope_policies: &[(String, Option<soap::PolicyReference>)],
 ) -> Result<ExchangeUserTokenOutcome, rst::RSTError> {
-    let secret = BASE64_STANDARD.decode(device_token.binary_secret.as_ref().unwrap())?;
-    let secret: [u8; 4096] = secret.try_into().unwrap();
+    let secret = BASE64_STANDARD.decode(device_token.binary_secret.as_ref().ok_or(rst::RSTError::InvalidEncryptedPayload)?)?;
+    let secret: [u8; 4096] = secret.try_into().map_err(|_| rst::RSTError::InvalidEncryptedPayload)?;
     let secret: ClepHmacState = transmute!(secret);
     let hmac_secret = secret.get_hmac_state();
 
@@ -142,7 +198,7 @@ mod test {
         let client = reqwest::Client::new();
 
         let mgr = TokenManager::with_memory();
-        ensure_device_credentials(&client, &mgr).await;
+        ensure_device_credentials(&client, &mgr).await.unwrap();
 
         let token: Token = mgr.get_device_sts_token().unwrap();
         let Token::Legacy(token) = token else {
@@ -158,7 +214,7 @@ mod test {
         .await
         .unwrap();
 
-        let ms_device_token: Token = resp.into();
+        let ms_device_token = Token::try_from(resp).unwrap();
         let Token::Compact(ms_device_token) = ms_device_token else {
             todo!("Unsupported token");
         };
