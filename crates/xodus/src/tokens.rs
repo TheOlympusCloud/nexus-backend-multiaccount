@@ -8,3 +8,5 @@ pub use manager::{PASSPORT_STS, TokenManager};
 
 #[cfg(test)]
 mod credential_tests;
+#[cfg(test)]
+mod credential_concurrency_tests;

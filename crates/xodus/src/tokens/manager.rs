@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::models::secrets::{Device, Token, TokenStore, User};
@@ -65,6 +65,10 @@ mod credential_account_metadata_tests {
 pub struct TokenManager {
     persistent: Arc<dyn TokenBackend>,
     ephemeral: Arc<dyn ExpiringTokenBackend>,
+    // Serialize full read/merge/write/verify operations among this manager's
+    // clones. Individual backend get/set locks do not protect a transaction.
+    // Independent managers/processes still require backend-level coordination.
+    persistent_updates: Arc<Mutex<()>>,
 }
 
 impl TokenManager {
@@ -75,6 +79,7 @@ impl TokenManager {
         Self {
             persistent,
             ephemeral,
+            persistent_updates: Arc::new(Mutex::new(())),
         }
     }
 
@@ -97,6 +102,7 @@ impl TokenManager {
     }
 
     pub fn remove_persistent(&self) -> Result<(), TokenStoreError> {
+        let _update = self.persistent_update()?;
         self.persistent.remove(keys::DEVICE_TOKENS)?;
         self.persistent.remove(keys::USER_TOKENS)?;
         self.persistent.remove(keys::USER_INFO)?;
@@ -116,6 +122,7 @@ impl TokenManager {
     }
 
     pub fn save_device_license(&self, device: &Device) -> Result<(), TokenStoreError> {
+        let _update = self.persistent_update()?;
         Self::write_verified(
             &*self.persistent,
             keys::DEV_LICENSE,
@@ -124,6 +131,7 @@ impl TokenManager {
     }
 
     pub fn remove_device_license(&self) -> Result<(), TokenStoreError> {
+        let _update = self.persistent_update()?;
         self.persistent.remove(keys::DEV_LICENSE)
     }
 
@@ -134,6 +142,7 @@ impl TokenManager {
     }
 
     pub fn save_device_token(&self, address: String, token: Token) -> Result<(), TokenStoreError> {
+        let _update = self.persistent_update()?;
         Self::write_token_store(&*self.persistent, keys::DEVICE_TOKENS, address, token)
     }
 
@@ -152,6 +161,7 @@ impl TokenManager {
     }
 
     pub fn save_user_token(&self, address: String, token: Token) -> Result<(), TokenStoreError> {
+        let _update = self.persistent_update()?;
         if let Some(mut session) = self.user_session()? {
             session.tokens.insert(address, token);
             return Self::write_verified(
@@ -190,6 +200,7 @@ impl TokenManager {
     }
 
     pub fn save_user(&self, user: &User) -> Result<(), TokenStoreError> {
+        let _update = self.persistent_update()?;
         Self::write_verified(
             &*self.persistent,
             keys::USER_INFO,
@@ -212,6 +223,7 @@ impl TokenManager {
         user: User,
         tokens: HashMap<String, Token>,
     ) -> Result<(), TokenStoreError> {
+        let _update = self.persistent_update()?;
         if tokens.is_empty() || user.username.trim().is_empty() || user.puid.is_empty() {
             return Err(TokenStoreError::NotFound);
         }
@@ -249,6 +261,12 @@ impl TokenManager {
     }
 
     // ---- shared TokenStore read/modify/write helper ---------------------------
+
+    fn persistent_update(&self) -> Result<MutexGuard<'_, ()>, TokenStoreError> {
+        self.persistent_updates.lock().map_err(|_| {
+            std::io::Error::other("Credential update was interrupted").into()
+        })
+    }
 
     fn write_verified(
         backend: &dyn TokenBackend,
