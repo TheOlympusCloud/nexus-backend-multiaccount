@@ -71,3 +71,20 @@ fn credential_sisu_rejects_missing_duplicate_unknown_and_malformed_tokens_withou
     assert!(sisu_user_tokens(ExchangeUserTokenOutcome::Fault(None)).is_err());
     assert!(!InvalidTokenResponse.to_string().contains("private-value"));
 }
+
+#[test]
+fn credential_sisu_checks_all_expiries_and_selects_the_ticket_lifetime() {
+    let compact = response("urn:passport:compact", "synthetic-ticket");
+    let expected = chrono::DateTime::parse_from_rfc3339(&compact.lifetime.expires).unwrap().timestamp();
+    let mut legacy = response("urn:passport:legacy", "");
+    legacy.lifetime.expires = "2029-01-01T00:00:00Z".into();
+    let selected = issued_user_tokens(collection(vec![legacy, compact])).unwrap();
+    assert_eq!(selected.expiry, expected);
+    for bad_legacy in [false, true] {
+        let mut compact = response("urn:passport:compact", "synthetic-ticket");
+        let mut legacy = response("urn:passport:legacy", "");
+        if bad_legacy { legacy.lifetime.expires = "invalid".into(); }
+        else { compact.lifetime.expires = "invalid".into(); }
+        assert!(issued_user_tokens(collection(vec![compact, legacy])).is_err());
+    }
+}

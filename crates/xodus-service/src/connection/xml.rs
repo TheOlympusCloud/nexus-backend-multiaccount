@@ -67,7 +67,10 @@ pub async fn parse_message(
             } else {
                 "xboxlive.signin"
             };
-            let device_token = context.device_token.as_ref().ok_or(xodus::models::secrets::InvalidTokenResponse)?;
+            let device_token = context
+                .device_token
+                .as_ref()
+                .ok_or(xodus::models::secrets::InvalidTokenResponse)?;
             let device_token_resp = xodus::api::live::exchange_device_token(
                 &context.client,
                 device_token.clone(),
@@ -77,15 +80,17 @@ pub async fn parse_message(
             )
             .await;
 
-            let ms_device_rps_token = if let Some((Ok(Token::Compact(ms_device_token)), Ok(lifetime))) =
-                device_token_resp.ok().map(|t| {
-                    let expiry = chrono::DateTime::parse_from_rfc3339(&t.lifetime.expires);
-                    (Token::try_from(t), expiry)
-                }) {
-                Some((ms_device_token, lifetime.timestamp()))
-            } else {
-                None
-            };
+            let ms_device_rps_token =
+                if let Some((Ok(Token::Compact(ms_device_token)), Ok(lifetime))) =
+                    device_token_resp.ok().map(|t| {
+                        let expiry = chrono::DateTime::parse_from_rfc3339(&t.lifetime.expires);
+                        (Token::try_from(t), expiry)
+                    })
+                {
+                    Some((ms_device_token, lifetime.timestamp()))
+                } else {
+                    None
+                };
 
             let user_token = xodus::api::live::exchange_user_token(
                 &context.client,
@@ -105,51 +110,182 @@ pub async fn parse_message(
             )
             .await?;
 
-            match user_token {
-                ExchangeUserTokenOutcome::Issued(
-                    soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
-                ) => {
-                    if let Some(sts) = collection.security_tokens.pop() {
-                        let address = sts.applies_to.endpoint_reference.address.clone();
-                        let sts: Token = sts.try_into()?;
-                        let address = if let Token::Legacy(legacy) = &sts {
-                            legacy.key_name.clone().unwrap_or(address)
-                        } else {
-                            address
-                        };
-                        if let Err(err) = context.tokens().save_user_token(address, sts) {
-                            tracing::warn!("Failed to persist refreshed STS token: {err}");
-                        }
-                    }
-                    let token = collection.security_tokens.into_iter().next().ok_or(xodus::models::secrets::InvalidTokenResponse)?;
-                    let expiry = chrono::DateTime::parse_from_rfc3339(&token.lifetime.expires)?;
-                    let token: Token = token.try_into()?;
-                    let Token::Compact(user_token) = token else {
-                        return Ok(vec![]);
-                    };
-                    // Store licensing uses this same session facade. Bind the
-                    // Xbox ticket's MSA principal to its current Store account,
-                    // never infer either account identifier from an Xbox XUID.
-                    let current_identity = context.tokens().get_user_sts_session().ok().flatten();
-                    let (xbox_msa_account_id, store_msa_account_id) = crate::account_metadata::bound_ids(
-                        identity_session.as_ref().map(|(user, _)| user),
-                        current_identity.as_ref().map(|(user, _)| user));
-                    let payload = MSATokenResponse {
-                        token: user_token,
-                        expiry: expiry.timestamp(),
-                        device_expiry: ms_device_rps_token.as_ref().map(|(_, r)| *r).unwrap_or(0),
-                        xbox_msa_account_id,
-                        store_msa_account_id,
-                        device_rps: ms_device_rps_token
-                            .map(|(t, _)| t)
-                            .unwrap_or_else(String::new),
-                    };
-                    let payload = quick_xml::se::to_string(&payload)?;
-                    Ok(payload.as_bytes().to_vec())
-                }
-                _ => Err(xodus::models::secrets::InvalidTokenResponse.into()),
-            }
+            let (user_token, expiry) = accept_user_tokens(context, user_token)?;
+            // Store licensing uses this same session facade. Bind the
+            // Xbox ticket's MSA principal to its current Store account,
+            // never infer either account identifier from an Xbox XUID.
+            let current_identity = context.tokens().get_user_sts_session().ok().flatten();
+            let (xbox_msa_account_id, store_msa_account_id) = crate::account_metadata::bound_ids(
+                identity_session.as_ref().map(|(user, _)| user),
+                current_identity.as_ref().map(|(user, _)| user),
+            );
+            let payload = MSATokenResponse {
+                token: user_token,
+                expiry,
+                device_expiry: ms_device_rps_token.as_ref().map(|(_, r)| *r).unwrap_or(0),
+                xbox_msa_account_id,
+                store_msa_account_id,
+                device_rps: ms_device_rps_token
+                    .map(|(t, _)| t)
+                    .unwrap_or_else(String::new),
+            };
+            let payload = quick_xml::se::to_string(&payload)?;
+            Ok(payload.as_bytes().to_vec())
         }
         _ => Err("Unimplemented".into()),
+    }
+}
+
+fn accept_user_tokens(
+    context: &SimpleContext,
+    outcome: ExchangeUserTokenOutcome,
+) -> Result<(String, i64), Box<dyn std::error::Error + Send + Sync>> {
+    // Parse every token and its expiry before any credential-store mutation.
+    let selected = xodus::auth::issued_user_tokens(outcome)?;
+    if let Some((address, token)) = selected.refreshed {
+        if let Err(error) = context.tokens().save_user_token(address, token) {
+            tracing::warn!("Failed to persist refreshed STS token: {error}");
+        }
+    }
+    Ok((selected.token, selected.expiry))
+}
+
+#[cfg(test)]
+mod token_response_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+    use xodus::tokens::{TokenManager, manager::PASSPORT_STS};
+
+    fn response(kind: &str, value: &str) -> soap::RequestSecurityTokenResponse {
+        let mut result: soap::RequestSecurityTokenResponse = serde_json::from_value(json!({
+            "TokenType": kind, "AppliesTo":{"EndpointReference":{"Address":"http://Passport.NET/tb"}},
+            "Lifetime":{"Created":"2026-10-28T00:00:00Z","Expires":"2027-10-29T00:00:00Z"},
+            "RequestedSecurityToken":{"BinarySecurityToken":{"@Id":"fixture","$value":value}}
+        })).unwrap();
+        if kind == "urn:passport:legacy" {
+            result.requested_security_token.binary_security_token = None;
+            result.requested_security_token.encrypted_data = Some(
+                soap::EncryptedData::devicesoftware("new-synthetic-ciphertext".into()),
+            );
+        }
+        result
+    }
+    fn context() -> SimpleContext {
+        let tokens = Arc::new(TokenManager::with_memory());
+        tokens
+            .save_user_token(
+                PASSPORT_STS.into(),
+                Token::Compact("previous-synthetic-ticket".into()),
+            )
+            .unwrap();
+        let device = xodus::models::secrets::LegacyToken {
+            key_name: None,
+            token: "unused-synthetic-device".into(),
+            binary_secret: None,
+            tpm_key: None,
+            lifetime: soap::Timestamp {
+                id: None,
+                created: "2026-01-01T00:00:00Z".into(),
+                expires: "2027-01-01T00:00:00Z".into(),
+            },
+        };
+        SimpleContext::new(device, tokens)
+    }
+    fn collection(values: Vec<soap::RequestSecurityTokenResponse>) -> ExchangeUserTokenOutcome {
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(
+            soap::RequestSecurityTokenResponseCollection {
+                security_tokens: values,
+            },
+        ))
+    }
+    #[test]
+    fn token_response_selects_types_in_both_orders() {
+        for reverse in [false, true] {
+            let context = context();
+            let mut values = vec![
+                response("urn:passport:compact", "t=synthetic&proof=value"),
+                response("urn:passport:legacy", ""),
+            ];
+            if reverse {
+                values.reverse();
+            }
+            let (ticket, expiry) = accept_user_tokens(&context, collection(values)).unwrap();
+            assert_eq!(ticket, "t=synthetic&proof=value");
+            assert!(expiry > 0);
+            assert!(matches!(
+                context.tokens().get_user_sts_token().unwrap(),
+                Token::Legacy(_)
+            ));
+        }
+    }
+    #[test]
+    fn token_response_invalid_expiry_does_not_replace_credentials() {
+        let context = context();
+        let mut compact = response("urn:passport:compact", "synthetic");
+        compact.lifetime.expires = "invalid".into();
+        assert!(
+            accept_user_tokens(
+                &context,
+                collection(vec![compact, response("urn:passport:legacy", "")])
+            )
+            .is_err()
+        );
+        assert!(
+            matches!(context.tokens().get_user_sts_token().unwrap(), Token::Compact(value) if value == "previous-synthetic-ticket")
+        );
+    }
+    #[test]
+    fn token_response_ambiguous_reply_does_not_replace_credentials() {
+        let context = context();
+        let values = vec![
+            response("urn:passport:compact", "one"),
+            response("urn:passport:compact", "two"),
+            response("urn:passport:legacy", ""),
+        ];
+        assert!(accept_user_tokens(&context, collection(values)).is_err());
+        assert!(
+            matches!(context.tokens().get_user_sts_token().unwrap(), Token::Compact(value) if value == "previous-synthetic-ticket")
+        );
+    }
+
+    #[test]
+    fn token_response_rejects_incomplete_replies_before_persistence() {
+        let mut invalid_refresh = response("urn:passport:legacy", "");
+        invalid_refresh.lifetime.expires = "invalid".into();
+        for values in [
+            vec![],
+            vec![response("urn:passport:legacy", "")],
+            vec![
+                response("urn:passport:compact", ""),
+                response("urn:passport:legacy", ""),
+            ],
+            vec![
+                response("unknown-synthetic-type", "private-fixture"),
+                response("urn:passport:legacy", ""),
+            ],
+            vec![response("urn:passport:compact", "valid"), invalid_refresh],
+        ] {
+            let context = context();
+            let error = accept_user_tokens(&context, collection(values)).unwrap_err();
+            assert!(!error.to_string().contains("private-fixture"));
+            assert!(
+                matches!(context.tokens().get_user_sts_token().unwrap(), Token::Compact(value) if value == "previous-synthetic-ticket")
+            );
+        }
+    }
+
+    #[test]
+    fn token_response_single_ticket_keeps_existing_refresh_credential() {
+        let context = context();
+        let outcome =
+            ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
+                Box::new(response("urn:passport:compact", "synthetic-ticket")),
+            ));
+        let (ticket, _) = accept_user_tokens(&context, outcome).unwrap();
+        assert_eq!(ticket, "synthetic-ticket");
+        assert!(
+            matches!(context.tokens().get_user_sts_token().unwrap(), Token::Compact(value) if value == "previous-synthetic-ticket")
+        );
     }
 }

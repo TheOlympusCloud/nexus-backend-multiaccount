@@ -17,9 +17,15 @@ use crate::tokens::TokenManager;
 
 type RefreshedUserToken = (String, Token);
 
-/// Two requested scopes may be returned in either order. Reject ambiguous or
-/// incomplete replies before persisting anything or making an Xbox request.
-fn sisu_user_tokens(outcome: ExchangeUserTokenOutcome) -> Result<(String, Option<RefreshedUserToken>), crate::models::secrets::InvalidTokenResponse> {
+/// Validated token types and expiry fields, including an optional refresh credential. Selection is
+/// shared by the CLI and service so response ordering cannot change token roles.
+pub struct IssuedUserTokens {
+    pub token: String,
+    pub expiry: i64,
+    pub refreshed: Option<(String, Token)>,
+}
+
+pub fn issued_user_tokens(outcome: ExchangeUserTokenOutcome) -> Result<IssuedUserTokens, crate::models::secrets::InvalidTokenResponse> {
     use crate::models::secrets::InvalidTokenResponse;
     let responses = match outcome {
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) => collection.security_tokens,
@@ -30,16 +36,25 @@ fn sisu_user_tokens(outcome: ExchangeUserTokenOutcome) -> Result<(String, Option
     let mut refreshed = None;
     for response in responses {
         let address = response.applies_to.endpoint_reference.address.clone();
+        let expiry = chrono::DateTime::parse_from_rfc3339(&response.lifetime.expires)
+            .map_err(|_| InvalidTokenResponse)?.timestamp();
         match Token::try_from(response)? {
-            Token::Compact(value) if compact.is_none() && !value.is_empty() && !matches!(value.as_str(), "d=" | "t=") => compact = Some(value),
+            Token::Compact(value) if compact.is_none() && !value.is_empty() && !matches!(value.as_str(), "d=" | "t=") => compact = Some((value, expiry)),
             Token::Legacy(value) if refreshed.is_none() => {
                 let address = value.key_name.clone().unwrap_or(address);
+                if address.trim().is_empty() { return Err(InvalidTokenResponse); }
                 refreshed = Some((address, Token::Legacy(value)));
             }
             _ => return Err(InvalidTokenResponse),
         }
     }
-    Ok((compact.ok_or(InvalidTokenResponse)?, refreshed))
+    let (token, expiry) = compact.ok_or(InvalidTokenResponse)?;
+    Ok(IssuedUserTokens { token, expiry, refreshed })
+}
+
+fn sisu_user_tokens(outcome: ExchangeUserTokenOutcome) -> Result<(String, Option<RefreshedUserToken>), crate::models::secrets::InvalidTokenResponse> {
+    let selected = issued_user_tokens(outcome)?;
+    Ok((selected.token, selected.refreshed))
 }
 
 #[cfg(test)]
