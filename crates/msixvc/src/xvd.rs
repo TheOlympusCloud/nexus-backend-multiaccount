@@ -19,7 +19,7 @@ use uuid::Uuid;
 use zerocopy::IntoBytes;
 
 use crate::crypt::{TweakGenerator, decrypt_page_xts};
-use crate::layout::{Bytes, PAGE_SIZE, PAGES_PER_BLOCK, Pages};
+use crate::layout::{Bytes, PAGE_SIZE, Pages};
 use crate::math::calculate_hash_block_num_and_run_for_block_num;
 use crate::models::xvd::layout::XvdLayout;
 use crate::models::xvd::{
@@ -29,6 +29,9 @@ use crate::models::xvd::{
 };
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
 use crate::streaming_http::{Policy, RangeReader, TransferError};
+
+#[path = "streaming_hash_cache.rs"]
+mod hash_cache;
 
 #[cfg(test)]
 #[path = "package_metadata_tests.rs"]
@@ -455,7 +458,10 @@ impl XvdFile {
         }
 
         let mut enc_sections: Vec<EncryptedSectionInfo> = vec![];
-        let mut reader = BufReader::with_capacity(PAGES_PER_BLOCK * XvdHashEntry::SIZE, file);
+        let mut reader = file;
+        let mut hash_cache = hash_cache::HashCache::default();
+        let hash_tree_end = layout.hash_tree.start.to_bytes().0.checked_add(layout.hash_tree.len.0)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "Hash-tree bounds overflow."))?;
         for h in region_headers {
             let key_id = h.key_id;
             let num_pages = h.length.0;
@@ -489,12 +495,10 @@ impl XvdFile {
                 let read_offset = layout.hash_tree.start.to_bytes()
                     + Pages(hash_block).to_bytes()
                     + Bytes(entry_start as u64 * XvdHashEntry::SIZE as u64);
-                reader.seek(SeekFrom::Start(read_offset.0)).await?;
-
-                let mut buf = XvdHashEntry::buffer();
-                for _ in 0..run_length {
-                    reader.read_exact(&mut buf).await?;
-                    let hash = XvdHashEntry::from_array(&buf);
+                let bytes = hash_cache.read(&mut reader, read_offset.0,
+                    run_length as usize * XvdHashEntry::SIZE, hash_tree_end).await?;
+                for entry in bytes.chunks_exact(XvdHashEntry::SIZE) {
+                    let hash = XvdHashEntry::from_array(entry.try_into().unwrap());
                     data_units.push(hash.unit);
                     data_hashs.push(hash.block_hash);
                 }

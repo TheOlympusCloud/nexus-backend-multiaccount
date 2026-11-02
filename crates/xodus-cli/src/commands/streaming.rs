@@ -459,7 +459,11 @@ where
         Ok(files) => files,
         Err(error) => { eprintln!("Unable to inspect installed package files: {error}"); return ExitCode::FAILURE; }
     };
-    let installed_journal = match resume::Journal::open(out, &remote_xvd.resume_identity(), &rfiles) {
+    let identity = match resume::Journal::identity(&remote_xvd.resume_identity(), &rfiles) {
+        Ok(identity) => identity,
+        Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+    };
+    let installed_journal = match resume::Journal::open_with_identity(out, &identity) {
         Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
         Err(error) => { eprintln!("Unable to prepare download checkpoints: {error}"); return ExitCode::FAILURE; }
     };
@@ -473,7 +477,7 @@ where
         pending.retain(|(name,file)| !update::completed(&installed_journal.lock().unwrap(),out,name,file));
     }
     let journal = match &stage {
-        Some(stage) => match resume::Journal::open(stage, &remote_xvd.resume_identity(), &rfiles) {
+        Some(stage) => match resume::Journal::open_with_identity(stage, &identity) {
             Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
             Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
         },
