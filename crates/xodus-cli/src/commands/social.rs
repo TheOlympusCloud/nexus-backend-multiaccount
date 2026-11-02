@@ -8,6 +8,9 @@ const PEOPLE: &str = "https://peoplehub.xboxlive.com/users/me/people/friends/dec
 const MESSAGES: &str = "https://xblmessaging.xboxlive.com/network/Xbox/users/me/conversations/users/";
 const LIMIT: usize = 2 * 1024 * 1024;
 
+#[path = "social_session.rs"]
+mod chat_session;
+
 enum Operation { Friends, Conversation(String), Send(String, String) }
 struct Plan { url: String, contract: &'static str, body: Option<Value> }
 
@@ -114,6 +117,10 @@ fn payload(op: &Operation, value: &Value) -> Result<Value, &'static str> {
     }
 }
 async fn execute(tokens: &TokenManager, op: &Operation) -> Result<Value, &'static str> {
+    if let Operation::Send(peer, message) = op {
+        let (value, account) = chat_session::send(tokens, peer, message).await?;
+        return Ok(json!({"schema":1,"account":account,"result":value}));
+    }
     // Existing bounded, silent Xbox session path; no new client identity or login.
     let (client, authorization, account) = super::profile::xbox_session(tokens).await?;
     if tokens.get_user().map_err(|_| "account-changed")?.username != account { return Err("account-changed"); }
