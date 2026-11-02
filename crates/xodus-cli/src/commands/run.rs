@@ -1,6 +1,8 @@
-use std::collections::HashMap;
-use std::os::fd::{AsFd, IntoRawFd};
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use msixvc::layout::PAGE_SIZE;
@@ -10,13 +12,712 @@ use nix::unistd::Pid;
 #[cfg(target_os = "linux")]
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+use tempfile::{Builder, TempDir};
 #[cfg(not(target_os = "linux"))]
 use tempfile::{tempdir, tempfile, tempfile_in};
 use tokio::fs::{File, OpenOptions};
 use tokio::process::Command;
+use xodus::models::secrets::Token;
 use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
+
+const PLAYFAB_RELYING_PARTY: &str = "http://playfab.xboxlive.com/";
+
+async fn playfab_auth_header(client: &reqwest::Client, tokens: &TokenManager) -> Option<String> {
+    let Ok(Token::Legacy(dev_token)) = tokens.get_device_sts_token() else {
+        return None;
+    };
+    let Ok(Token::Legacy(user_token)) = tokens.get_user_sts_token() else {
+        return None;
+    };
+
+    let xsts = xodus::api::xbox::run(client, dev_token, user_token, PLAYFAB_RELYING_PARTY).await.ok()?;
+    xodus::api::xbox::get_xsts_auth_header(xsts).ok()
+}
+
+const LAUNCH_STUB_SUFFIX: &str = ".xodus-launch.exe";
+const LAUNCH_VIEW_PREFIXES: [&str; 3] = [".xodus-chain-", ".xodus-offline-", ".xodus-mounts-"];
+const LAUNCH_VIEW_LOCK_SUFFIX: &str = ".lock";
+
+/// A temporary launch view plus the lock that marks it in use. The lock fd is
+/// inherited by Wine and the game, so it stays held while any process of the
+/// session is alive. A session that dies without dropping this leaves the
+/// view behind; once the last holder exits the kernel releases the lock, so
+/// the next launch's sweep can tell the view is stale.
+struct LaunchView {
+    dir: TempDir,
+    _lock: Option<LaunchViewLock>,
+}
+
+impl LaunchView {
+    fn new(dir: TempDir) -> Self {
+        Self::with_lock(dir, LaunchViewLock::acquire)
+    }
+
+    fn with_lock(dir: TempDir, acquire: impl FnOnce(&Path) -> std::io::Result<LaunchViewLock>) -> Self {
+        // A volume without working locks still launches. Its lockless views
+        // are never swept: age alone cannot prove that a session has ended.
+        let lock = acquire(&launch_view_lock_path(dir.path()))
+            .inspect_err(|error| eprintln!("could not lock launch view {}: {}", dir.path().display(), error))
+            .ok();
+        Self { dir, _lock: lock }
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn inherit_into(&self, command: &mut std::process::Command) -> std::io::Result<()> {
+        if let Some(lock) = &self._lock { lock.inherit_into(command)?; }
+        Ok(())
+    }
+}
+
+struct LaunchViewLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl LaunchViewLock {
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        Self::acquire_with(path, |file| {
+            let flags = fcntl_getfd(file)?;
+            fcntl_setfd(file, flags | FdFlags::CLOEXEC)?;
+            Ok(())
+        })
+    }
+
+    fn acquire_with(path: &Path, prepare: impl FnOnce(&std::fs::File) -> std::io::Result<()>) -> std::io::Result<Self> {
+        // Lock under a private name, then rename into place, so a sweep never
+        // finds the final lock file unlocked while its view is live. Finish
+        // all fallible preparation before publishing that file.
+        let staging = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
+        fs2::FileExt::try_lock_exclusive(staging.as_file())?;
+        prepare(staging.as_file())?;
+        let file = staging.persist_noclobber(path).map_err(|error| error.error)?;
+        Ok(Self { path: path.to_path_buf(), _file: file })
+    }
+
+    fn inherit_into(&self, command: &mut std::process::Command) -> std::io::Result<()> {
+        // An owned CLOEXEC duplicate keeps the descriptor valid until spawn.
+        // Only this command's child clears the flag; concurrent helper programs
+        // must not retain a game session's workspace lock.
+        let file = self._file.try_clone()?;
+        unsafe {
+            command.pre_exec(move || {
+                // Only fcntl syscalls and errno conversion after fork. No
+                // allocation, logging, locks, environment reads or keyring I/O.
+                let flags = fcntl_getfd(&file)?;
+                fcntl_setfd(&file, flags - FdFlags::CLOEXEC)?;
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LaunchViewLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Open an existing lock file for locking without blocking on, or following,
+/// anything that is not a regular file. Write access lets the exclusive lock
+/// work where flock is emulated with byte-range locks (NFS).
+const MOUNT_WORKSPACE_PREFIX: &str = ".xodus-mounts-";
+const MOUNT_WORKSPACE_ENV: &str = "XODUS_MOUNT_ROOT";
+
+fn mount_workspace_marker_matches(file: &std::fs::File, directory: &std::fs::Metadata) -> bool {
+    let Ok(metadata) = file.metadata() else { return false };
+    if metadata.len() == 0 || metadata.len() > 128 { return false; }
+    let mut bytes = [0u8; 128];
+    let Ok(length) = file.read_at(&mut bytes, 0) else { return false };
+    if length as u64 != metadata.len() { return false; }
+    let Ok(text) = std::str::from_utf8(&bytes[..length]) else { return false };
+    let mut lines = text.lines();
+    lines.next() == Some("NXM1")
+        && lines.next().and_then(|v| v.parse::<u64>().ok()) == Some(directory.dev())
+        && lines.next().and_then(|v| v.parse::<u64>().ok()) == Some(directory.ino())
+        && lines.next().is_none()
+}
+
+/// The host owns the workspace so Wine sharing modes and a game crash cannot
+/// strand copied content forever. An inherited flock keeps live descendants
+/// protected; a later launch sweeps a terminated session's verified workspace.
+struct DlcMountWorkspace {
+    view: Option<LaunchView>,
+    windows_path: String,
+}
+
+impl DlcMountWorkspace {
+    fn new(source_root: &Path) -> std::io::Result<Self> {
+        Self::from_view(launch_view_directory(source_root, MOUNT_WORKSPACE_PREFIX)?)
+    }
+
+    fn from_view(view: LaunchView) -> std::io::Result<Self> {
+        let lock = view._lock.as_ref().ok_or_else(||
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "DLC workspace requires a session lock"))?;
+        let metadata = std::fs::symlink_metadata(view.path())?;
+        let marker = format!("NXM1\n{}\n{}\n", metadata.dev(), metadata.ino());
+        lock._file.write_all_at(marker.as_bytes(), 0)?;
+        lock._file.set_len(marker.len() as u64)?;
+        let path = view.path().to_str().ok_or_else(||
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "DLC workspace path is not UTF-8"))?;
+        let windows_path = format!("Z:{}", path.replace('/', "\\"));
+        Ok(Self { view: Some(view), windows_path })
+    }
+
+    fn configure(&self, command: &mut Command) -> std::io::Result<()> {
+        if let Some(view) = &self.view { view.inherit_into(command.as_std_mut())?; }
+        command.env(MOUNT_WORKSPACE_ENV, &self.windows_path);
+        Ok(())
+    }
+}
+
+impl Drop for DlcMountWorkspace {
+    fn drop(&mut self) {
+        let Some(LaunchView { dir, mut _lock }) = self.view.take() else { return };
+        // Disable TempDir's unconditional removal while descendants may still
+        // own the inherited descriptor. Removing their live view is unsafe.
+        let path = dir.keep();
+        let Some(mut lock) = _lock.take() else { return };
+        let lock_path = std::mem::take(&mut lock.path);
+        let expected_lock = lock._file.metadata().ok();
+        drop(lock); // Close our fd without unlinking the published lock.
+        let Ok(file) = open_launch_view_lock(&lock_path) else { return };
+        let matching_lock = expected_lock.as_ref().is_some_and(|expected|
+            file.metadata().is_ok_and(|actual| actual.dev() == expected.dev() && actual.ino() == expected.ino()));
+        if !matching_lock { return; }
+        let matching_directory = std::fs::symlink_metadata(&path).is_ok_and(|metadata|
+            metadata.is_dir() && mount_workspace_marker_matches(&file, &metadata));
+        if !matching_directory {
+            // Never leave a sweep marker attached to a replaced directory.
+            let _ = std::fs::remove_file(lock_path);
+            return;
+        }
+        if fs2::FileExt::try_lock_exclusive(&file).is_ok() && std::fs::remove_dir_all(&path).is_ok() {
+            let _ = std::fs::remove_file(lock_path);
+        }
+    }
+}
+
+fn open_launch_view_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "launch view lock is not a file"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)?;
+    // Recheck the opened descriptor too, in case the entry changed after the
+    // initial metadata lookup. A non-regular file is never a session lock.
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "launch view lock is not a file"));
+    }
+    Ok(file)
+}
+
+fn launch_view_lock_path(view: &Path) -> PathBuf {
+    let mut name = view.as_os_str().to_os_string();
+    name.push(LAUNCH_VIEW_LOCK_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Remove launch views in `parent` left by sessions that ended without
+/// cleaning up. A view whose lock another process holds is in use and kept.
+fn sweep_stale_launch_views(parent: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(parent) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Views in the temp-dir fallback carry the same prefix without the dot.
+        let undotted = name.strip_prefix('.').unwrap_or(name);
+        if !LAUNCH_VIEW_PREFIXES.iter().any(|prefix| undotted.starts_with(&prefix[1..])) {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(view) = name.strip_suffix(LAUNCH_VIEW_LOCK_SUFFIX) {
+            // A lock whose view is already gone: drop it once nobody holds it.
+            let view = parent.join(view);
+            if std::fs::symlink_metadata(&view).is_err() {
+                if let Ok(file) = open_launch_view_lock(&path) {
+                    if fs2::FileExt::try_lock_exclusive(&file).is_ok() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else { continue };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let lock_path = launch_view_lock_path(&path);
+        let stale = match open_launch_view_lock(&lock_path) {
+            Ok(file) => {
+                if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+                    continue;
+                }
+                if undotted.starts_with(&MOUNT_WORKSPACE_PREFIX[1..])
+                    && !mount_workspace_marker_matches(&file, &metadata) {
+                    continue;
+                }
+                let stale = std::fs::remove_dir_all(&path).is_ok();
+                if stale {
+                    let _ = std::fs::remove_file(&lock_path);
+                }
+                stale
+            }
+            // Missing, unsupported or unreadable locks give no reliable proof
+            // of inactivity. Preserve these views, including older builds.
+            Err(_) => false,
+        };
+        if stale {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn sweep_and_report(parent: &Path) {
+    let removed = sweep_stale_launch_views(parent);
+    if removed > 0 {
+        eprintln!("removed {} stale launch views from {}", removed, parent.display());
+    }
+}
+
+fn launch_image_error(name: &str, operation: &str, error: std::io::Error) -> std::io::Error {
+    let shown: String = name.chars().take(240).collect();
+    std::io::Error::new(error.kind(), format!("package image {shown:?}: {operation}: {error}"))
+}
+
+async fn open_launch_image(path: &Path, name: &str, content: &SegmentFile) -> std::io::Result<File> {
+    let expected = content.stored_length().map_err(|e| launch_image_error(name, "invalid metadata", e))?;
+    let file = File::open(path).await.map_err(|e| launch_image_error(name, "could not open local file", e))?;
+    let metadata = file.metadata().await.map_err(|e| launch_image_error(name, "could not inspect local file", e))?;
+    if !metadata.is_file() {
+        return Err(launch_image_error(name, "invalid local file", std::io::Error::new(
+            std::io::ErrorKind::InvalidData, "not a regular file")));
+    }
+    if metadata.len() < expected {
+        return Err(launch_image_error(name, "incomplete local file", std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("expected at least {expected} bytes, found {}; retry installation to repair game files", metadata.len()))));
+    }
+    Ok(file)
+}
+
+fn inherit_launch_image(file: std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
+    let mut flags = fcntl_getfd(file.as_fd()).map_err(|e| launch_image_error(name, "could not read file descriptor flags", e.into()))?;
+    flags.remove(FdFlags::CLOEXEC);
+    fcntl_setfd(file.as_fd(), flags).map_err(|e| launch_image_error(name, "could not prepare file descriptor", e.into()))?;
+    Ok(file)
+}
+
+fn select_launch_entry<'a>(
+    fds: &[(&'a String, RawFd)],
+    selected: Option<&str>,
+) -> std::io::Result<(&'a String, RawFd)> {
+    if let Some(selected) = selected {
+        let selected_path = checked_relative_path(selected)?;
+        let selected_path = selected_path.to_string_lossy();
+        let matching: Vec<_> = fds.iter().copied().filter(|(name, _)| {
+            checked_relative_path(name).is_ok_and(|candidate| {
+                candidate.to_string_lossy().eq_ignore_ascii_case(&selected_path)
+            })
+        }).collect();
+        let exact: Vec<_> = matching.iter().copied().filter(|(name, _)| {
+            checked_relative_path(name).is_ok_and(|candidate| candidate.to_string_lossy() == selected_path)
+        }).collect();
+        let matching = if exact.is_empty() { matching } else { exact };
+        return match matching.as_slice() {
+            [entry] => Ok(*entry),
+            [] => Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+                format!("selected executable is not present in package launch images: {selected}"))),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                "selected executable has ambiguous package launch images")),
+        };
+    }
+    fds.first().copied().ok_or_else(|| std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no encrypted launch image was found",
+    ))
+}
+
+async fn prepare_plain_launch_entry(
+    source: &Path,
+    files: &HashMap<String, SegmentFile>,
+    selected: Option<&str>,
+) -> std::io::Result<Option<(String, std::fs::File)>> {
+    let Some(selected) = selected else { return Ok(None); };
+    let selected = checked_relative_path(selected)?;
+    let selected = selected.to_string_lossy();
+    let matching: Vec<_> = files.iter().filter(|(name, _)| {
+        checked_relative_path(name).is_ok_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&selected))
+    }).collect();
+    let exact: Vec<_> = matching.iter().copied().filter(|(name, _)| {
+        checked_relative_path(name).is_ok_and(|name| name.to_string_lossy() == selected)
+    }).collect();
+    let matching = if exact.is_empty() { matching } else { exact };
+    if matching.len() > 1 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "selected executable has ambiguous package metadata"));
+    }
+    let Some((name, content)) = matching.first() else { return Ok(None); };
+    // Missing metadata or encrypted declarations never become an arbitrary
+    // plaintext fallback. The license and encrypted-image paths remain intact.
+    if content.keep_encrypted { return Ok(None); }
+    let relative = resolve_package_file(source, name)?;
+    let actual_name = relative.to_string_lossy().replace('/', "\\");
+    let file = open_launch_image(&source.join(relative), &actual_name, content).await?.into_std().await;
+    let mut signature = [0u8; 2];
+    file.read_exact_at(&mut signature, 0).map_err(|e| launch_image_error(&actual_name, "could not read plain launch image", e))?;
+    if signature != *b"MZ" {
+        return Err(launch_image_error(&actual_name, "invalid plain launch image", std::io::Error::new(std::io::ErrorKind::InvalidData, "not a PE file")));
+    }
+    Ok(Some((actual_name.clone(), inherit_launch_image(file, &actual_name)?)))
+}
+
+fn merge_plain_launch_files(files: &mut HashMap<String, SegmentFile>, plain: HashMap<String, SegmentFile>) {
+    let known: HashSet<String> = files.keys().map(|name| name.to_ascii_lowercase()).collect();
+    for (name, content) in plain {
+        // A plain-region read must never override an encrypted declaration or
+        // introduce another encrypted image through the supplemental path.
+        if !content.keep_encrypted && !known.contains(&name.to_ascii_lowercase()) {
+            files.insert(name, content);
+        }
+    }
+}
+
+fn wine_exit_code(status: std::process::ExitStatus) -> u8 {
+    // A signal termination is not a successful game launch. Preserve the
+    // conventional shell status (128 + signal) instead of reporting zero.
+    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(1)) as u8
+}
+
+// Real files in a full launch view must not be redirected back into memfds.
+// Keep source mappings and encrypted DLL mappings; no title/EAC special case.
+fn launch_file_maps(
+    fds: &[(&String, RawFd)],
+    source: &Path,
+    mirror_nt_prefix: Option<&str>,
+    entry_name: &str,
+    entry_fd: RawFd,
+    launch_image: &Path,
+    materialize_chain: bool,
+) -> (String, String) {
+    let source_nt = source.to_string_lossy().replace('/', "\\");
+    let source_nt = source_nt.trim_end_matches('\\');
+    let mirror_unix = mirror_nt_prefix.map(|prefix| prefix.replace('\\', "/"));
+    let mut dll_mappings = Vec::new();
+    let mut exe_mappings = Vec::new();
+    for (name, fd) in fds {
+        let nt_suffix = name.trim_start_matches('\\');
+        let unix_suffix = nt_suffix.replace('\\', "/");
+        dll_mappings.push(format!("{fd}:\\??\\Z:{source_nt}\\{nt_suffix}"));
+        exe_mappings.push(format!("{fd}:{}/{unix_suffix}", source.display()));
+        let real_image = materialize_chain
+            && (name.to_ascii_lowercase().ends_with(".exe") || name.as_str() == entry_name);
+        if !real_image {
+            if let Some(prefix) = mirror_nt_prefix {
+                dll_mappings.push(format!("{fd}:\\??\\Z:{prefix}\\{nt_suffix}"));
+            }
+            if let Some(prefix) = &mirror_unix {
+                exe_mappings.push(format!("{fd}:{prefix}/{unix_suffix}"));
+            }
+        }
+    }
+    if !materialize_chain {
+        let launch_nt = launch_image.to_string_lossy().replace('/', "\\");
+        dll_mappings.push(format!("{entry_fd}:\\??\\Z:{launch_nt}"));
+        exe_mappings.push(format!("{entry_fd}:{}", launch_image.display()));
+    }
+    (dll_mappings.join("|"), exe_mappings.join("|"))
+}
+
+fn checked_relative_path(name: &str) -> std::io::Result<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in name.split(['\\', '/']).filter(|component| !component.is_empty()) {
+        if component == "." || component == ".." || component.contains(':') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsafe executable path: {name}"),
+            ));
+        }
+        relative.push(component);
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "launch executable has no path components",
+        ));
+    }
+    Ok(relative)
+}
+
+// Resolve physical Linux names independently from Windows package metadata.
+// Preserve aliases inside the package, but never follow a path outside it.
+fn resolve_package_file(root: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let relative = checked_relative_path(name)?;
+    let base = root.canonicalize()?;
+    let mut current = base.clone();
+    for component in relative.components() {
+        let component = component.as_os_str();
+        let entries = std::fs::read_dir(&current)?.collect::<std::io::Result<Vec<_>>>()?;
+        let exact = entries.iter().find(|entry| entry.file_name() == component);
+        let matches: Vec<_> = if let Some(exact) = exact { vec![exact] } else {
+            entries.iter().filter(|entry| {
+                entry.file_name().to_str().zip(component.to_str())
+                    .is_some_and(|(actual, requested)| actual.eq_ignore_ascii_case(requested))
+            }).collect()
+        };
+        if matches.len() != 1 {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+                "package path is missing or has ambiguous letter casing"));
+        }
+        current.push(matches[0].file_name());
+        if !current.canonicalize()?.starts_with(&base) {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                "package path escapes the installation directory"));
+        }
+    }
+    if !current.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "package image is not a regular file"));
+    }
+    Ok(current.strip_prefix(&base).unwrap().to_path_buf())
+}
+
+fn populate_launch_view(
+    source_root: &Path,
+    mirror_root: &Path,
+    relative_directory: &Path,
+    real_directories: &HashSet<PathBuf>,
+    decrypted_files: &HashSet<PathBuf>,
+) -> std::io::Result<()> {
+    for item in std::fs::read_dir(source_root.join(relative_directory))? {
+        let item = item?;
+        let relative = relative_directory.join(item.file_name());
+        let destination = mirror_root.join(&relative);
+        if real_directories.contains(&relative) {
+            if !item.metadata()?.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("expected a game directory: {}", relative.display()),
+                ));
+            }
+            std::fs::create_dir(&destination)?;
+            populate_launch_view(source_root, mirror_root, &relative, real_directories, decrypted_files)?;
+        } else if decrypted_files.contains(&relative) {
+            if !item.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("expected a game executable: {}", relative.display()),
+                ));
+            }
+        } else {
+            symlink(item.path(), destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn probe_launch_view_links(directory: &Path) -> std::io::Result<()> {
+    let probe = directory.join(".xodus-link-probe");
+    symlink(".", &probe)?;
+    std::fs::remove_file(probe)
+}
+
+fn check_private_launch_view(directory: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(std::io::Error::from_raw_os_error(nix::libc::EPERM));
+    }
+    Ok(())
+}
+
+fn launch_view_directory_with(
+    source_root: &Path,
+    fallback: &Path,
+    prefix: &str,
+    mut probe: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<TempDir> {
+    let parent = source_root.parent().unwrap_or(fallback);
+    let permissions = || std::fs::Permissions::from_mode(0o700);
+    if let Ok(directory) = Builder::new().prefix(prefix).permissions(permissions()).tempdir_in(parent) {
+        match probe(directory.path()).and_then(|()| check_private_launch_view(directory.path())) {
+            Ok(()) => return Ok(directory),
+            Err(error) if matches!(error.raw_os_error(), Some(nix::libc::EPERM | nix::libc::EOPNOTSUPP | nix::libc::ENOSYS)) => {
+                // Some install filesystems cannot preserve private permissions
+                // or create symlinks. Drop only this empty view, then try the temp
+                // directory once. Never change mount/security settings or copy
+                // the whole game as a substitute for the links.
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let directory = Builder::new().prefix(prefix.trim_start_matches('.')).permissions(permissions()).tempdir_in(fallback)?;
+    probe(directory.path())?;
+    check_private_launch_view(directory.path())?;
+    Ok(directory)
+}
+
+fn swept_launch_view(source_root: &Path, fallback: &Path, prefix: &str) -> std::io::Result<LaunchView> {
+    let parent = source_root.parent().unwrap_or(fallback);
+    sweep_and_report(parent);
+    let view = LaunchView::new(launch_view_directory_with(source_root, fallback, prefix, probe_launch_view_links)?);
+    // A view that fell back to the temp dir is locked before that dir is
+    // swept, so the sweep keeps it.
+    if view.path().parent() != Some(parent) {
+        sweep_and_report(fallback);
+    }
+    Ok(view)
+}
+
+fn launch_view_directory(source_root: &Path, prefix: &str) -> std::io::Result<LaunchView> {
+    swept_launch_view(source_root, &std::env::temp_dir(), prefix)
+}
+
+fn create_launch_chain_mirror(
+    source_root: &Path,
+    entry_suffix: &str,
+    fds: &[(&String, RawFd)],
+) -> std::io::Result<(LaunchView, PathBuf, usize, u64)> {
+    let entry_path = checked_relative_path(entry_suffix)?;
+    let mut decrypted = HashMap::new();
+    for (name, fd) in fds {
+        if name.to_ascii_lowercase().ends_with(".exe") || checked_relative_path(name)? == entry_path {
+            decrypted.insert(checked_relative_path(name)?, *fd);
+        }
+    }
+    if !decrypted.contains_key(&entry_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "selected executable is not present in package launch images",
+        ));
+    }
+    let mut real_directories = HashSet::new();
+    for relative in decrypted.keys() {
+        let mut parent = relative.parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            real_directories.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+    let decrypted_files: HashSet<PathBuf> = decrypted.keys().cloned().collect();
+    let mirror = launch_view_directory(source_root, ".xodus-chain-")?;
+    populate_launch_view(
+        source_root,
+        mirror.path(),
+        Path::new(""),
+        &real_directories,
+        &decrypted_files,
+    )?;
+    let mut bytes = 0;
+    for (relative, fd) in &decrypted {
+        bytes += write_launch_stub(&mirror.path().join(relative), *fd, true)?;
+    }
+    let executable_count = decrypted.len();
+    let entry = mirror.path().join(entry_path);
+    Ok((mirror, entry, executable_count, bytes))
+}
+
+fn create_launch_mirror(
+    source_root: &Path,
+    entry_suffix: &str,
+) -> std::io::Result<(LaunchView, PathBuf)> {
+    let mirror = launch_view_directory(source_root, ".xodus-offline-")?;
+    let components: Vec<&str> = entry_suffix
+        .split(['\\', '/'])
+        .filter(|component| !component.is_empty())
+        .collect();
+    if components.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "launch executable has no path components",
+        ));
+    }
+
+    let mut source_directory = source_root.to_path_buf();
+    let mut mirror_directory = mirror.path().to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        for item in std::fs::read_dir(&source_directory)? {
+            let item = item?;
+            if item.file_name() == std::ffi::OsStr::new(component) {
+                continue;
+            }
+            symlink(item.path(), mirror_directory.join(item.file_name()))?;
+        }
+
+        source_directory.push(component);
+        mirror_directory.push(component);
+        if index + 1 < components.len() {
+            std::fs::create_dir(&mirror_directory)?;
+        }
+    }
+
+    Ok((mirror, mirror_directory))
+}
+
+fn write_launch_stub(stub_path: &Path, fd: RawFd, materialize: bool) -> std::io::Result<u64> {
+    let invalid = |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string());
+
+    // Borrow the decrypted memfd without taking ownership; Wine still needs it.
+    let image = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    let image_len = image.metadata()?.len();
+    let mut head = vec![0u8; PAGE_SIZE];
+    let read = image.read_at(&mut head, 0)?;
+    head.truncate(read);
+
+    if head.len() < 0x40 || head[..2] != *b"MZ" {
+        return Err(invalid("decrypted image is not a PE file"));
+    }
+    let pe = u32::from_le_bytes(head[0x3c..0x40].try_into().unwrap()) as usize;
+    let size_of_headers_at = pe + 24 + 60;
+    if pe + 4 > head.len() || size_of_headers_at + 4 > head.len() {
+        return Err(invalid("PE header lies outside the first page"));
+    }
+    if head[pe..pe + 4] != *b"PE\0\0" {
+        return Err(invalid("missing PE signature"));
+    }
+    let size_of_headers = u32::from_le_bytes(
+        head[size_of_headers_at..size_of_headers_at + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    if size_of_headers == 0 {
+        return Err(invalid("PE reports a zero-length header"));
+    }
+    if size_of_headers > head.len() {
+        head.resize(size_of_headers, 0);
+        image.read_exact_at(&mut head, 0)?;
+    }
+
+    let stub = std::fs::File::create(stub_path)?;
+    if materialize {
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut offset = 0u64;
+        while offset < image_len {
+            let bytes = (image_len - offset).min(buffer.len() as u64) as usize;
+            image.read_exact_at(&mut buffer[..bytes], offset)?;
+            stub.write_all_at(&buffer[..bytes], offset)?;
+            offset += bytes as u64;
+        }
+    } else {
+        stub.write_all_at(&head[..size_of_headers], 0)?;
+        // A sparse tail lets Wine probe/map all PE sections without storing game code.
+        stub.set_len(image_len.max(size_of_headers as u64))?;
+    }
+    stub.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    Ok(image_len)
+}
 
 #[cfg(target_os = "linux")]
 fn make_temp_file(_folder: &str) -> std::io::Result<std::fs::File> {
@@ -112,17 +813,38 @@ async fn prepare(_lfiles: &HashMap<String, SegmentFile>) -> (impl AsyncFnOnce(),
     (async || {}, "".to_owned())
 }
 
+/// What the runtime may do with its offline identity for this launch:
+/// `use` it (the launch runs on a validated stored license), `store` it (this
+/// device holds a fresh offline lease), or neither.
+pub fn offline_identity_mode(license_used: bool, lease_stored: bool) -> Option<&'static str> {
+    if license_used {
+        Some("use")
+    } else if lease_stored {
+        Some("store")
+    } else {
+        None
+    }
+}
+
 pub async fn run(
     client: &reqwest::Client,
     tokens: &TokenManager,
     source: String,
     wine: String,
     exe: Option<String>,
+    materialize_exe: bool,
+    materialize_chain: bool,
     market: Option<String>,
+    license_cache: Option<String>,
+    offline: bool,
 ) -> ExitCode {
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
     let out: &Path = Path::new(&source);
+    let _installation_guard = match crate::installation_state::launch_guard(out) {
+        Ok(guard) => guard,
+        Err(error) => { eprintln!("Cannot launch this game: {error}"); return ExitCode::FAILURE; }
+    };
     let out_absolute = std::fs::canonicalize(out).unwrap();
     let final_path = out.join(".xodus-streaming.msixvc");
 
@@ -154,13 +876,22 @@ pub async fn run(
             }
         }
         lfiles.extend(sfiles);
+    } else if let Ok(plain) = xvd.parse_ntfs_segment_metadata(&mut file, true).await {
+        // Files in an unencrypted region (e.g. a plaintext launch executable)
+        // are absent from the encrypted segment metadata. Streaming installs
+        // them from the plain NTFS view; declare them here as plain images
+        // without replacing any encrypted declaration.
+        merge_plain_launch_files(&mut lfiles, plain);
     }
 
+    let license_cache = license_cache.map(PathBuf::from);
     let license = get_license(
         client,
         tokens,
         xvd.content_id().to_string(),
         market.unwrap_or("neutral".to_string()),
+        license_cache.as_deref(),
+        offline,
     )
     .await;
     if let Err(err) = license {
@@ -181,7 +912,7 @@ pub async fn run(
 
     let full_key = content_key.unpack(&key).expect("failed to unpack");
 
-    let mut fds = vec![];
+    let mut opened_images = vec![];
 
     let (cleanup, mount_dir) = prepare(&lfiles).await;
 
@@ -189,59 +920,190 @@ pub async fn run(
         if !file.1.keep_encrypted {
             continue;
         }
-        let mut game_exe = File::from_std(make_temp_file(&mount_dir).unwrap());
-
-        let source_path = out.join(file.0.replace("\\", "/"));
-
-        let mut i = File::open(&source_path).await.unwrap();
-
-        xvd.mount_mem_fd(&mut i, &mut game_exe, file.1, *full_key, |_, _| {})
-            .await
-            .unwrap();
-
-        let stdf = game_exe.into_std().await;
-
-        let mut flags = fcntl_getfd(stdf.as_fd()).unwrap();
-        flags.remove(FdFlags::CLOEXEC);
-        fcntl_setfd(stdf.as_fd(), flags).unwrap();
-
-        fds.push((file.0, stdf.into_raw_fd()));
-    }
-
-    let mut env_value = String::new();
-    let nt_prefix = out_absolute.to_string_lossy().replace("/", "\\");
-    let nt_prefix = nt_prefix.trim_end_matches('\\');
-
-    let mut nt_entry = None;
-
-    for fd in fds {
-        if !env_value.is_empty() {
-            env_value.push('|');
-        }
-
-        let nt_suffix = fd.0.trim_start_matches('\\');
-        let nt_path = format!("\\??\\Z:{}\\{}", nt_prefix, nt_suffix);
-        if let Some(exe) = &exe {
-            if exe == fd.0 {
-                nt_entry = Some(nt_path)
+        let relative = match resolve_package_file(out, file.0) {
+            Ok(relative) => relative,
+            Err(error) => {
+                eprintln!("failed to resolve package image {}: {}", file.0, error);
+                cleanup().await;
+                return ExitCode::FAILURE;
             }
-        } else if nt_entry.is_none() {
-            nt_entry = Some(nt_path)
+        };
+        let source_path = out.join(&relative);
+        let name = relative.to_string_lossy().replace('/', "\\");
+        let prepared = async {
+            let mut input = open_launch_image(&source_path, &name, file.1).await?;
+            let output = make_temp_file(&mount_dir).map_err(|e| launch_image_error(&name, "could not create temporary image", e))?;
+            let mut output = File::from_std(output);
+            xvd.mount_mem_fd(&mut input, &mut output, file.1, *full_key, |_, _| {})
+                .await.map_err(|e| launch_image_error(&name, "decryption failed", std::io::Error::other(e.to_string())))?;
+            inherit_launch_image(output.into_std().await, &name)
+        }.await;
+        match prepared {
+            Ok(image) => opened_images.push((name, image)),
+            Err(error) => {
+                eprintln!("failed to prepare launch: {error}");
+                cleanup().await;
+                return ExitCode::FAILURE;
+            }
         }
-
-        env_value.push_str(&format!("{}:\\??\\Z:{}\\{}", fd.1, nt_prefix, nt_suffix))
     }
 
-    let Some(nt_entry) = nt_entry else {
-        eprintln!("Could not find .exe");
-        return ExitCode::FAILURE;
+    // All launch-view paths and file maps must use the resolved on-disk case,
+    // not only the import readiness check or the selected executable name.
+    // Keep ownership until launch finishes, including failure cleanup paths.
+    match prepare_plain_launch_entry(out, &lfiles, exe.as_deref()).await {
+        Ok(Some(image)) => opened_images.push(image),
+        Ok(None) => (),
+        Err(error) => {
+            eprintln!("failed to prepare selected package executable: {error}");
+            cleanup().await;
+            return ExitCode::FAILURE;
+        }
+    }
+    let fds: Vec<_> = opened_images.iter().map(|(name, file)| (name, file.as_raw_fd())).collect();
+
+    let (entry_name, entry_fd) = match select_launch_entry(&fds, exe.as_deref()) {
+        Ok(entry) => entry,
+        Err(error) => {
+            eprintln!("failed to select launch image: {error}");
+            cleanup().await;
+            return ExitCode::FAILURE;
+        }
+    };
+    let entry_suffix = entry_name.trim_start_matches('\\');
+
+    let (launch_mirror, stub_path, mirror_nt_prefix) = if materialize_chain {
+        match create_launch_chain_mirror(&out_absolute, entry_suffix, &fds) {
+            Ok((mirror, path, count, bytes)) => {
+                eprintln!(
+                    "created a temporary launch view with {} decrypted executables ({} bytes) at {}",
+                    count,
+                    bytes,
+                    mirror.path().display()
+                );
+                let prefix = mirror.path().to_string_lossy().replace("/", "\\");
+                (Some(mirror), path, Some(prefix))
+            }
+            Err(err) => {
+                eprintln!("failed to create temporary launch chain: {}", err);
+                cleanup().await;
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if materialize_exe {
+        match create_launch_mirror(&out_absolute, entry_suffix) {
+            Ok((mirror, path)) => {
+                let prefix = mirror.path().to_string_lossy().replace("/", "\\");
+                (Some(mirror), path, Some(prefix))
+            }
+            Err(err) => {
+                eprintln!("failed to create temporary launch view: {}", err);
+                cleanup().await;
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        let stub_suffix = format!("{}{}", entry_suffix, LAUNCH_STUB_SUFFIX);
+        (
+            None,
+            out_absolute.join(stub_suffix.replace("\\", "/")),
+            None,
+        )
     };
 
-    let mut wn = Command::new(wine)
-        .arg(nt_entry)
+    let (env_value, exe_env_value) = launch_file_maps(
+        &fds, &out_absolute, mirror_nt_prefix.as_deref(), entry_name, entry_fd,
+        &stub_path, materialize_chain,
+    );
+
+    let image_len = if materialize_chain {
+        0
+    } else {
+        match write_launch_stub(&stub_path, entry_fd, materialize_exe) {
+            Ok(image_len) => image_len,
+            Err(err) => {
+                eprintln!(
+                    "failed to write launch image {}: {}",
+                    stub_path.display(),
+                    err
+                );
+                cleanup().await;
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    if materialize_exe && !materialize_chain {
+        eprintln!(
+            "created a temporary offline view with {} decrypted bytes at {}",
+            image_len,
+            stub_path.display()
+        );
+    }
+
+    let mount_workspace = DlcMountWorkspace::new(&out_absolute)
+        .inspect_err(|error| eprintln!("could not prepare downloadable content workspace: {error}"))
+        .ok();
+    let mut command = Command::new(wine);
+    command
+        .arg(&stub_path)
         .env("WINE_DLL_FILE_MAP", env_value)
-        .spawn()
-        .unwrap();
+        .env("WINE_EXE_FILE_MAP", exe_env_value);
+    command.env_remove(MOUNT_WORKSPACE_ENV);
+    let inherit_views = (|| -> std::io::Result<()> {
+        if let Some(view) = &launch_mirror { view.inherit_into(command.as_std_mut())?; }
+        if let Some(workspace) = &mount_workspace { workspace.configure(&mut command)?; }
+        Ok(())
+    })();
+    if let Err(error) = inherit_views {
+        eprintln!("could not attach launch workspace to Wine: {error}");
+        drop(command);
+        let _ = std::fs::remove_file(&stub_path);
+        drop(mount_workspace);
+        drop(launch_mirror);
+        cleanup().await;
+        return ExitCode::FAILURE;
+    }
+    if offline {
+        // The runtime treats the network as unreachable at once instead of
+        // waiting for its own connect timeouts.
+        command.env("XODUS_FORCE_OFFLINE", "1");
+    }
+    // The runtime's offline identity follows the license decision, never its
+    // own (xuser-offline-identity-v2): it may sign in from the cached identity
+    // only on a launch running on a stored license that passed its lease
+    // checks, and keep the identity only when Microsoft issued this device an
+    // offline lease. Otherwise it removes the account's cached identity.
+    command.env_remove("XODUS_OFFLINE_IDENTITY");
+    if let Some(mode) = offline_identity_mode(
+        crate::license::OFFLINE_LICENSE_USED.load(std::sync::atomic::Ordering::Relaxed),
+        crate::license::OFFLINE_LEASE_STORED.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        command.env("XODUS_OFFLINE_IDENTITY", mode);
+    }
+    if offline || crate::license::OFFLINE_LICENSE_USED.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("Microsoft is unreachable; skipping PlayFab authorisation (the runtime signs in with its cached identity)");
+    } else {
+        match playfab_auth_header(client, tokens).await {
+            Some(header) => {
+                command.env("XODUS_XSTS_PLAYFAB", header);
+            }
+            None => eprintln!("could not authorise a PlayFab token; in-game sign-in may fail"),
+        }
+    }
+
+    let spawned = command.spawn();
+    drop(command); // Release parent copies retained by pre_exec closures.
+    let mut wn = match spawned {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("failed to start Wine: {}", err);
+            let _ = std::fs::remove_file(&stub_path);
+            drop(mount_workspace);
+            drop(launch_mirror);
+            cleanup().await;
+            return ExitCode::FAILURE;
+        }
+    };
 
     let pid = wn.id().unwrap();
 
@@ -254,7 +1116,867 @@ pub async fn run(
 
     let status = wn.wait().await.unwrap();
 
+    let _ = std::fs::remove_file(&stub_path);
+    drop(mount_workspace);
+    drop(launch_mirror);
     cleanup().await;
 
-    ExitCode::from(status.code().map(|c| c as u8).unwrap_or(0))
+    ExitCode::from(wine_exit_code(status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn dlc_workspace_is_private_and_sets_only_the_child_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game with spaces");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("keep.bin"), b"original").unwrap();
+        let workspace = DlcMountWorkspace::new(&game).unwrap();
+        let view = workspace.view.as_ref().unwrap();
+        assert_eq!(std::fs::symlink_metadata(view.path()).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(mount_workspace_marker_matches(&view._lock.as_ref().unwrap()._file, &std::fs::metadata(view.path()).unwrap()));
+        let mut command = Command::new("true");
+        command.env(MOUNT_WORKSPACE_ENV, "inherited/foreign");
+        workspace.configure(&mut command).unwrap();
+        let value = command.as_std().get_envs().find(|(key, _)| *key == MOUNT_WORKSPACE_ENV).unwrap().1.unwrap();
+        assert_eq!(value, std::ffi::OsStr::new(&format!("Z:{}", view.path().to_str().unwrap().replace('/', "\\"))));
+        drop(command);
+        let path = view.path().to_path_buf();
+        std::fs::write(path.join("readonly.bin"), b"copied").unwrap();
+        std::fs::set_permissions(path.join("readonly.bin"), std::fs::Permissions::from_mode(0o444)).unwrap();
+        symlink(&game, path.join("outside")).unwrap();
+        drop(workspace);
+        // Another parallel fixture may be between fork and exec, before its
+        // CLOEXEC descriptors close. Keep that transient holder safe, then
+        // require the normal stale-view sweep to remove the workspace.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() && std::time::Instant::now() < deadline {
+            sweep_stale_launch_views(root.path());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!path.exists());
+        assert!(!launch_view_lock_path(&path).exists());
+        assert_eq!(std::fs::read(game.join("keep.bin")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn dlc_workspace_unrelated_child_does_not_keep_workspace_alive() {
+        use std::io::BufRead;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = DlcMountWorkspace::new(&root.path().join("game")).unwrap();
+        let path = workspace.view.as_ref().unwrap().path().to_path_buf();
+        let mut intended = std::process::Command::new("true");
+        workspace.view.as_ref().unwrap().inherit_into(&mut intended).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "printf 'ready\\n'; read -r line"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        drop(intended);
+        drop(workspace);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() && std::time::Instant::now() < deadline {
+            sweep_stale_launch_views(root.path());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let retained = path.exists();
+        child.stdin.take().unwrap().write_all(b"done\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(!retained, "an unrelated executable inherited the game workspace lock");
+    }
+
+    #[test]
+    fn dlc_workspace_failed_launch_releases_owned_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = DlcMountWorkspace::new(&root.path().join("game")).unwrap();
+        let path = workspace.view.as_ref().unwrap().path().to_path_buf();
+        let mut command = std::process::Command::new(root.path().join("does-not-exist"));
+        workspace.view.as_ref().unwrap().inherit_into(&mut command).unwrap();
+        assert!(command.spawn().is_err());
+        drop(command);
+        drop(workspace);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() && std::time::Instant::now() < deadline {
+            sweep_stale_launch_views(root.path());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!path.exists() && !launch_view_lock_path(&path).exists());
+    }
+
+    #[test]
+    fn dlc_workspace_keeps_live_descendants_then_sweeps_after_the_last_owner_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = DlcMountWorkspace::new(&root.path().join("game")).unwrap();
+        let path = workspace.view.as_ref().unwrap().path().to_path_buf();
+        std::fs::write(path.join("content.bin"), b"private DLC").unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "read -r line"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        workspace.view.as_ref().unwrap().inherit_into(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        drop(workspace);
+        assert!(path.exists() && launch_view_lock_path(&path).exists());
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        child.stdin.take().unwrap().write_all(b"done\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(sweep_stale_launch_views(root.path()), 1);
+        assert!(!path.exists() && !launch_view_lock_path(&path).exists());
+    }
+
+    #[test]
+    fn dlc_workspace_rejects_lockless_views_without_publishing_an_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = Builder::new().prefix(MOUNT_WORKSPACE_PREFIX).tempdir_in(root.path()).unwrap();
+        let path = directory.path().to_path_buf();
+        let view = LaunchView::with_lock(directory, |_| Err(std::io::Error::other("fixture: locks unavailable")));
+        let error = DlcMountWorkspace::from_view(view).err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn dlc_workspace_sweep_rejects_missing_or_foreign_directory_markers() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, marker) in [(".xodus-mounts-unmarked", ""), ("xodus-mounts-foreign", "NXM1\n0\n0\n")] {
+            let path = root.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("keep.bin"), b"keep").unwrap();
+            std::fs::write(launch_view_lock_path(&path), marker).unwrap();
+        }
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert_eq!(std::fs::read(root.path().join(".xodus-mounts-unmarked/keep.bin")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(root.path().join("xodus-mounts-foreign/keep.bin")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn dlc_workspace_never_removes_a_replacement_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = DlcMountWorkspace::new(&root.path().join("game")).unwrap();
+        let path = workspace.view.as_ref().unwrap().path().to_path_buf();
+        let moved = root.path().join("moved-owned-workspace");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep.bin"), b"foreign").unwrap();
+        drop(workspace);
+        assert_eq!(std::fs::read(path.join("keep.bin")).unwrap(), b"foreign");
+        assert!(!launch_view_lock_path(&path).exists());
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert_eq!(std::fs::read(path.join("keep.bin")).unwrap(), b"foreign");
+    }
+
+    #[tokio::test]
+    async fn launch_image_preflight_rejects_incomplete_ciphertext_with_file_and_size_without_writing() {
+        for size in [0usize, 4095, 5000, 8191] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("Game.exe");
+            let original = vec![7u8; size];
+            std::fs::write(&path, &original).unwrap();
+            let content = SegmentFile { offset: 0, length: 5000, keep_encrypted: true, data_hashs: vec![] };
+            let error = open_launch_image(&path, "Bin\\Game.exe", &content).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            let message = error.to_string();
+            assert!(message.contains("Game.exe") && message.contains("expected at least 8192 bytes") && message.contains(&format!("found {size}")));
+            assert!(message.contains("retry installation"));
+            assert!(!message.contains(root.path().to_str().unwrap()));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_image_preflight_accepts_valid_plain_and_padded_images_without_changes() {
+        use tokio::io::AsyncReadExt;
+        for (length, stored, encrypted) in [(0,0,true), (1,4096,true), (4096,4096,true), (5000,8192,true), (5000,5000,false)] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("Game.exe");
+            let original = vec![9u8; stored];
+            std::fs::write(&path, &original).unwrap();
+            let content = SegmentFile { offset: 0, length, keep_encrypted: encrypted, data_hashs: vec![] };
+            let mut input = open_launch_image(&path, "Game.exe", &content).await.unwrap();
+            let mut read = vec![];
+            input.read_to_end(&mut read).await.unwrap();
+            assert_eq!(read, original);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_image_errors_are_named_bounded_and_do_not_panic_on_missing_or_nonfile_input() {
+        let root = tempfile::tempdir().unwrap();
+        let content = SegmentFile { offset: 0, length: 4, keep_encrypted: true, data_hashs: vec![] };
+        let error = open_launch_image(&root.path().join("missing"), "Missing.exe", &content).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("Missing.exe"));
+        assert!(open_launch_image(root.path(), "Folder", &content).await.is_err());
+        let error = launch_image_error(&format!("Bad\n{}", "x".repeat(1000)), "decryption failed", std::io::Error::other("early eof"));
+        assert!(!error.to_string().contains('\n'));
+        assert!(error.to_string().len() < 400);
+        assert!(error.to_string().contains("early eof"));
+    }
+
+    #[test]
+    fn launch_images_keep_owned_descriptors_with_inheritance_enabled() {
+        let file = tempfile::tempfile().unwrap();
+        let raw = file.as_raw_fd();
+        let image = inherit_launch_image(file, "Game.exe").unwrap();
+        assert_eq!(raw, image.as_raw_fd());
+        assert!(!fcntl_getfd(image.as_fd()).unwrap().contains(FdFlags::CLOEXEC));
+    }
+
+    #[test]
+    fn full_launch_view_uses_real_executables_and_preserves_encrypted_dll_maps() {
+        let entry = String::from("\\Launcher.exe");
+        let child = String::from("\\Bin\\Child.ExE");
+        let dll = String::from("\\Bin\\Encrypted.dll");
+        let files = [(&entry, 10), (&child, 11), (&dll, 12)];
+        let (nt, unix) = launch_file_maps(&files, Path::new("/package"), Some("\\view"),
+            &entry, 10, Path::new("/view/Launcher.exe"), true);
+        assert!(nt.contains("10:\\??\\Z:\\package\\Launcher.exe"));
+        assert!(unix.contains("10:/package/Launcher.exe"));
+        assert!(!nt.contains("\\view\\Launcher.exe"));
+        assert!(!nt.contains("\\view\\Bin\\Child.ExE"));
+        assert!(!unix.contains("/view/Launcher.exe"));
+        assert!(!unix.contains("/view/Bin/Child.ExE"));
+        assert!(nt.contains("12:\\??\\Z:\\view\\Bin\\Encrypted.dll"));
+        assert!(unix.contains("12:/view/Bin/Encrypted.dll"));
+    }
+
+    #[test]
+    fn materialized_selected_image_is_real_even_without_an_exe_suffix() {
+        let entry = String::from("Entry.bin");
+        let (nt, unix) = launch_file_maps(&[(&entry, 10)], Path::new("/package"),
+            Some("\\view"), &entry, 10, Path::new("/view/Entry.bin"), true);
+        assert!(!nt.contains("\\view\\Entry.bin"));
+        assert!(!unix.contains("/view/Entry.bin"));
+    }
+
+    #[test]
+    fn legacy_stub_launch_retains_both_file_maps() {
+        let entry = String::from("Game.exe");
+        let (nt, unix) = launch_file_maps(&[(&entry, 10)], Path::new("/package"), None,
+            &entry, 10, Path::new("/package/Game.exe.xodus-launch.exe"), false);
+        assert!(nt.contains("10:\\??\\Z:\\package\\Game.exe.xodus-launch.exe"));
+        assert!(unix.contains("10:/package/Game.exe.xodus-launch.exe"));
+    }
+
+    #[test]
+    fn selected_image_matches_windows_case_and_path_separators() {
+        let repair = String::from("Engine\\GamingRepair.exe");
+        let shipping = String::from("Dungeons\\Binaries\\WinGDK\\Shipping.exe");
+        let files = [(&repair, 10), (&shipping, 11)];
+        assert_eq!(
+            select_launch_entry(&files, Some("\\dungeons/binaries/wingdk/shipping.EXE")).unwrap().1,
+            11,
+        );
+    }
+
+    #[test]
+    fn missing_selected_image_never_launches_an_unrelated_installer() {
+        let repair = String::from("Engine\\GamingRepair.exe");
+        let files = [(&repair, 10)];
+        assert!(select_launch_entry(&files, Some("Game.exe")).is_err());
+        assert!(select_launch_entry(&files, Some("..\\Game.exe")).is_err());
+        assert!(select_launch_entry(&[], None).is_err());
+    }
+
+    #[test]
+    fn signal_termination_is_reported_as_failure() {
+        assert_eq!(wine_exit_code(std::process::ExitStatus::from_raw(9)), 137);
+        assert_eq!(wine_exit_code(std::process::ExitStatus::from_raw(15)), 143);
+        assert_eq!(wine_exit_code(std::process::ExitStatus::from_raw(0)), 0);
+        assert_eq!(wine_exit_code(std::process::ExitStatus::from_raw(84 << 8)), 84);
+    }
+
+    fn fake_pe() -> Vec<u8> {
+        let mut image = vec![0u8; 1024];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        image[0x80..0x84].copy_from_slice(b"PE\0\0");
+        image[0xd4..0xd8].copy_from_slice(&0x200u32.to_le_bytes());
+        image
+    }
+
+    fn age(path: &Path, seconds: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds);
+        std::fs::File::open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    #[test]
+    fn launch_view_sweep_removes_views_whose_session_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        // What a killed session leaves: its view, and a lock nobody holds.
+        let path = root.path().join(".xodus-chain-killed");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("vkd3d-proton.cache.write"), b"cache").unwrap();
+        let lock_path = launch_view_lock_path(&path);
+        std::fs::write(&lock_path, b"").unwrap();
+        // The next launch sweeps it before creating its own view.
+        let next = launch_view_directory(&root.path().join("game"), ".xodus-chain-").unwrap();
+        assert!(!path.exists());
+        assert!(!lock_path.exists());
+        assert!(next.path().exists());
+    }
+
+    #[test]
+    fn launch_view_lock_is_inherited_by_the_game() {
+        let root = tempfile::tempdir().unwrap();
+        let view = launch_view_directory(&root.path().join("game"), ".xodus-chain-").unwrap();
+        let lock = view._lock.as_ref().unwrap();
+        assert!(fcntl_getfd(&lock._file).unwrap().contains(FdFlags::CLOEXEC));
+        // The descendant-lifetime fixture verifies explicit child inheritance.
+    }
+
+    #[test]
+    fn launch_view_sweep_skips_locks_that_are_not_files() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join(".xodus-chain-fifo");
+        std::fs::create_dir(&view).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(launch_view_lock_path(&view))
+            .arg(root.path().join(".xodus-chain-orphan.lock"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert!(view.exists());
+    }
+
+    #[test]
+    fn launch_view_sweep_keeps_views_a_running_session_holds() {
+        let root = tempfile::tempdir().unwrap();
+        let live = launch_view_directory(&root.path().join("game"), ".xodus-chain-").unwrap();
+        age(live.path(), 3 * 24 * 60 * 60);
+        let other = launch_view_directory(&root.path().join("game"), ".xodus-offline-").unwrap();
+        assert!(live.path().exists());
+        assert!(launch_view_lock_path(live.path()).exists());
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert!(live.path().exists() && other.path().exists());
+        let (live_path, other_path) = (live.path().to_path_buf(), other.path().to_path_buf());
+        drop(live);
+        drop(other);
+        assert!(!live_path.exists() && !launch_view_lock_path(&live_path).exists());
+        assert!(!other_path.exists() && !launch_view_lock_path(&other_path).exists());
+    }
+
+    #[test]
+    fn launch_view_sweep_cleans_the_temp_dir_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let stale = fallback.path().join("xodus-chain-killed");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(launch_view_lock_path(&stale), b"").unwrap();
+        // The install parent does not exist, so the view falls back.
+        let view = swept_launch_view(&root.path().join("missing").join("game"), fallback.path(), ".xodus-chain-").unwrap();
+        assert_eq!(view.path().parent(), Some(fallback.path()));
+        assert!(!stale.exists() && !launch_view_lock_path(&stale).exists());
+        assert!(view.path().exists() && launch_view_lock_path(view.path()).exists());
+    }
+
+    #[test]
+    fn launch_view_sweep_keeps_orphan_locks_still_held() {
+        let root = tempfile::tempdir().unwrap();
+        let orphan = root.path().join(".xodus-chain-orphan.lock");
+        std::fs::write(&orphan, b"").unwrap();
+        let holder = std::fs::File::open(&orphan).unwrap();
+        fs2::FileExt::lock_exclusive(&holder).unwrap();
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert!(orphan.exists());
+        drop(holder);
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn launch_view_sweep_preserves_lockless_views_regardless_of_age() {
+        let root = tempfile::tempdir().unwrap();
+        let fresh = root.path().join(".xodus-chain-fresh");
+        let old = root.path().join(".xodus-chain-old");
+        let old_fallback = root.path().join("xodus-offline-old");
+        let unrelated = root.path().join("Gears of War E-Day");
+        for path in [&fresh, &old, &old_fallback, &unrelated] {
+            std::fs::create_dir(path).unwrap();
+        }
+        age(&old, 2 * 24 * 60 * 60);
+        age(&old_fallback, 2 * 24 * 60 * 60);
+        age(&unrelated, 2 * 24 * 60 * 60);
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"x").unwrap();
+        symlink(&target, root.path().join(".xodus-chain-link")).unwrap();
+        std::fs::write(root.path().join(".xodus-chain-gone.lock"), b"").unwrap();
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert!(fresh.exists() && old.exists() && old_fallback.exists() && unrelated.exists());
+        assert!(target.join("keep").exists());
+        assert!(!root.path().join(".xodus-chain-gone.lock").exists());
+    }
+
+    #[test]
+    fn launch_view_lock_failure_keeps_launching_and_never_sweeps_the_live_view() {
+        for kind in [std::io::ErrorKind::Unsupported, std::io::ErrorKind::PermissionDenied] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = Builder::new().prefix(".xodus-chain-").tempdir_in(root.path()).unwrap();
+            let live = LaunchView::with_lock(dir, |_| Err(std::io::Error::from(kind)));
+            assert!(live._lock.is_none());
+            std::fs::write(live.path().join("game.exe"), b"keep").unwrap();
+            age(live.path(), 7 * 24 * 60 * 60);
+            let next = launch_view_directory(&root.path().join("game"), ".xodus-chain-").unwrap();
+            assert_eq!(sweep_stale_launch_views(root.path()), 0);
+            assert_eq!(std::fs::read(live.path().join("game.exe")).unwrap(), b"keep");
+            assert!(next.path().exists());
+            let path = live.path().to_path_buf();
+            drop(live);
+            assert!(!path.exists(), "ordinary session cleanup must still work without flock");
+        }
+    }
+
+    #[test]
+    fn launch_view_failed_lock_preparation_never_publishes_an_unheld_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(".xodus-chain-preparation");
+        std::fs::create_dir(&path).unwrap();
+        let lock_path = launch_view_lock_path(&path);
+        let result = LaunchViewLock::acquire_with(&lock_path, |_| Err(std::io::Error::other("synthetic fd failure")));
+        assert!(result.is_err());
+        assert!(!lock_path.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1, "staging file must be cleaned too");
+        age(&path, 7 * 24 * 60 * 60);
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn launch_view_lock_publication_never_replaces_an_existing_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(".xodus-chain-existing.lock");
+        let held = LaunchViewLock::acquire(&path).unwrap();
+        let result = LaunchViewLock::acquire(&path);
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists));
+        let reader = open_launch_view_lock(&path).unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&reader).is_err(), "original held inode must survive publication failure");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        drop(held);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn launch_view_sweep_keeps_old_views_with_invalid_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("unrelated");
+        std::fs::write(&target, b"keep").unwrap();
+        for (suffix, directory) in [("directory", true), ("symlink", false)] {
+            let view = root.path().join(format!(".xodus-chain-{suffix}"));
+            std::fs::create_dir(&view).unwrap();
+            age(&view, 7 * 24 * 60 * 60);
+            let lock = launch_view_lock_path(&view);
+            if directory { std::fs::create_dir(&lock).unwrap(); } else { symlink(&target, &lock).unwrap(); }
+            assert_eq!(sweep_stale_launch_views(root.path()), 0);
+            assert!(view.exists());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn launch_view_sweep_keeps_concurrent_live_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let start = std::sync::Barrier::new(6);
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                scope.spawn(|| {
+                    start.wait();
+                    for _ in 0..25 {
+                        let live = launch_view_directory(&root.path().join("game"), ".xodus-chain-").unwrap();
+                        std::fs::write(live.path().join("keep"), b"live").unwrap();
+                        age(live.path(), 7 * 24 * 60 * 60);
+                        sweep_stale_launch_views(root.path());
+                        assert_eq!(std::fs::read(live.path().join("keep")).unwrap(), b"live");
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    // Spawned only by the process-lifetime regression below. No account, game,
+    // prefix or system configuration is used, just a disposable directory.
+    #[test]
+    #[ignore = "subprocess fixture for launch-view lock inheritance"]
+    fn launch_view_process_fixture() {
+        let root = PathBuf::from(std::env::var_os("NEXUS_LAUNCH_VIEW_TEST_ROOT").unwrap());
+        let view = launch_view_directory(&root.join("game"), ".xodus-chain-").unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf 'VIEW_CHILD_READY\\n'; read -r release"]);
+        view.inherit_into(&mut command).unwrap();
+        let status = command.status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn launch_view_child_holds_lock_after_owner_is_killed() {
+        use std::io::{BufRead, Write};
+        use std::process::Stdio;
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "commands::run::tests::launch_view_process_fixture", "--nocapture"])
+            .env("NEXUS_LAUNCH_VIEW_TEST_ROOT", root.path())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap());
+        let stdout = fixture.0.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                if line.unwrap() == "VIEW_CHILD_READY" { sender.send("ready").unwrap(); }
+            }
+            let _ = sender.send("closed");
+        });
+        let limit = std::time::Duration::from_secs(10);
+        assert_eq!(receiver.recv_timeout(limit).unwrap(), "ready");
+        // Child::wait closes its stdin handle. Keep the pipe ourselves so the
+        // surviving shell does not receive EOF when its owner is reaped.
+        let mut release = fixture.0.stdin.take().unwrap();
+        fixture.0.kill().unwrap();
+        fixture.0.wait().unwrap();
+        let paths: Vec<_> = std::fs::read_dir(root.path()).unwrap().map(|e| e.unwrap().path())
+            .filter(|p| p.is_dir()).collect();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert!(paths[0].exists(), "the child still uses this view after its owner dies");
+        release.write_all(b"release\n").unwrap();
+        assert_eq!(receiver.recv_timeout(limit).unwrap(), "closed");
+        reader.join().unwrap();
+        assert_eq!(sweep_stale_launch_views(root.path()), 1);
+        assert!(!paths[0].exists() && !launch_view_lock_path(&paths[0]).exists());
+    }
+
+    #[test]
+    fn launch_chain_materializes_nested_executables_without_changing_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("game");
+        let nested = source.join("Dungeons/Binaries/WinGDK");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(source.join("Dungeons.exe"), b"encrypted launcher").unwrap();
+        std::fs::write(nested.join("Shipping.exe"), b"encrypted child").unwrap();
+        std::fs::write(source.join("MicrosoftGame.config"), b"metadata").unwrap();
+        std::fs::write(nested.join("assets.bin"), b"assets").unwrap();
+
+        let mut launcher = tempfile::tempfile().unwrap();
+        let mut child = tempfile::tempfile().unwrap();
+        launcher.write_all(&fake_pe()).unwrap();
+        child.write_all(&fake_pe()).unwrap();
+        let launcher_name = String::from("Dungeons.exe");
+        let child_name = String::from("Dungeons\\Binaries\\WinGDK\\Shipping.exe");
+        let files = vec![
+            (&launcher_name, launcher.as_raw_fd()),
+            (&child_name, child.as_raw_fd()),
+        ];
+
+        let (mirror, entry, count, bytes) =
+            create_launch_chain_mirror(&source, &launcher_name, &files).unwrap();
+        assert_eq!(entry, mirror.path().join("Dungeons.exe"));
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 2048);
+        assert_eq!(std::fs::read(&entry).unwrap(), fake_pe());
+        assert_eq!(std::fs::read(mirror.path().join(&child_name.replace('\\', "/"))).unwrap(), fake_pe());
+        assert!(std::fs::symlink_metadata(mirror.path().join("MicrosoftGame.config"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(mirror.path().join("Dungeons/Binaries/WinGDK/assets.bin"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(source.join("Dungeons.exe")).unwrap(), b"encrypted launcher");
+        assert_eq!(std::fs::read(nested.join("Shipping.exe")).unwrap(), b"encrypted child");
+    }
+
+    #[test]
+    fn launch_chain_rejects_parent_path_components() {
+        assert!(checked_relative_path("..\\outside.exe").is_err());
+    }
+
+    #[tokio::test]
+    async fn plain_launch_entry_uses_only_declared_package_images_and_preserves_sources() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Bin")).unwrap();
+        let original = fake_pe();
+        std::fs::write(root.path().join("Bin/MINECRAFT.WINDOWS.EXE"), &original).unwrap();
+        std::fs::write(root.path().join("MicrosoftGame.config"), b"metadata unchanged").unwrap();
+        let metadata = HashMap::from([(String::from("Bin\\Minecraft.Windows.exe"), SegmentFile { offset: 0, length: original.len() as u64, data_hashs: vec![], keep_encrypted: false })]);
+        let (name, file) = prepare_plain_launch_entry(root.path(), &metadata, Some("bin/Minecraft.Windows.exe")).await.unwrap().unwrap();
+        assert_eq!(name, "Bin\\MINECRAFT.WINDOWS.EXE");
+        assert!(!fcntl_getfd(file.as_fd()).unwrap().contains(FdFlags::CLOEXEC));
+        let dll_name = String::from("Encrypted.dll");
+        let mut dll = tempfile::tempfile().unwrap(); dll.write_all(b"synthetic decrypted library").unwrap();
+        let images = [(&dll_name, dll.as_raw_fd()), (&name, file.as_raw_fd())];
+        assert!(select_launch_entry(&images[..1], Some("bin/Minecraft.Windows.exe")).is_err());
+        assert_eq!(select_launch_entry(&images, Some("bin/Minecraft.Windows.exe")).unwrap().1, file.as_raw_fd());
+        let (mirror, entry, count, bytes) = create_launch_chain_mirror(root.path(), &name, &images).unwrap();
+        assert_eq!(count, 1); assert_eq!(bytes, original.len() as u64);
+        assert_eq!(std::fs::read(entry).unwrap(), original);
+        let (nt, _) = launch_file_maps(&images, root.path(), Some("\\synthetic-view"), &name, file.as_raw_fd(), &mirror.path().join("Bin/MINECRAFT.WINDOWS.EXE"), true);
+        assert!(nt.contains("synthetic-view\\Encrypted.dll"));
+        assert!(!nt.contains("synthetic-view\\Bin\\MINECRAFT.WINDOWS.EXE"));
+        assert_eq!(std::fs::read(root.path().join("Bin/MINECRAFT.WINDOWS.EXE")).unwrap(), original);
+        assert_eq!(std::fs::read(root.path().join("MicrosoftGame.config")).unwrap(), b"metadata unchanged");
+    }
+
+    #[tokio::test]
+    async fn plain_region_metadata_declares_selected_executable_without_replacing_encrypted_files() {
+        let root = tempfile::tempdir().unwrap();
+        let image = fake_pe();
+        std::fs::write(root.path().join("Minecraft.Windows.exe"), &image).unwrap();
+        let file = |encrypted| SegmentFile { offset: 37, length: image.len() as u64,
+            data_hashs: vec![], keep_encrypted: encrypted };
+        let mut files = HashMap::from([("Encrypted.dll".into(), file(true))]);
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("Minecraft.Windows.exe")).await.unwrap().is_none());
+        merge_plain_launch_files(&mut files, HashMap::from([
+            ("Minecraft.Windows.exe".into(), file(false)),
+            ("ENCRYPTED.DLL".into(), file(false)),
+            ("UnexpectedEncrypted.dll".into(), file(true)),
+        ]));
+        assert_eq!(files.len(), 2);
+        assert!(files["Encrypted.dll"].keep_encrypted);
+        assert!(!files.contains_key("ENCRYPTED.DLL"));
+        assert!(!files.contains_key("UnexpectedEncrypted.dll"));
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("minecraft.windows.exe")).await.unwrap().is_some());
+        assert!(prepare_plain_launch_entry(root.path(), &files, None).await.unwrap().is_none());
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("Unlisted.exe")).await.unwrap().is_none());
+        assert_eq!(std::fs::read(root.path().join("Minecraft.Windows.exe")).unwrap(), image);
+    }
+
+    #[test]
+    fn plain_region_metadata_empty_read_preserves_all_existing_declarations() {
+        let original = SegmentFile { offset: 123, length: 4096, data_hashs: vec![[7;20]], keep_encrypted: true };
+        let mut files = HashMap::from([("Game.exe".into(), original)]);
+        merge_plain_launch_files(&mut files, HashMap::new());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files["Game.exe"].offset, 123);
+        assert_eq!(files["Game.exe"].data_hashs, vec![[7;20]]);
+        assert!(files["Game.exe"].keep_encrypted);
+    }
+
+    #[tokio::test]
+    async fn plain_region_metadata_keeps_path_signature_and_ambiguity_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let image = fake_pe();
+        std::fs::write(root.path().join("Game.exe"), &image).unwrap();
+        let file = || SegmentFile { offset: 0, length: image.len() as u64, data_hashs: vec![], keep_encrypted: false };
+        let mut files = HashMap::new();
+        merge_plain_launch_files(&mut files, HashMap::from([
+            ("Game.exe".into(), file()), ("GAME.EXE".into(), file()), ("../outside.exe".into(), file()),
+        ]));
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("game.exe")).await.is_err());
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("../outside.exe")).await.is_err());
+        std::fs::write(root.path().join("Game.exe"), vec![0;image.len()]).unwrap();
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("Game.exe")).await.is_err());
+    }
+
+    #[test]
+    fn launch_entry_prefers_exact_case_and_refuses_ambiguous_case_fallbacks() {
+        let names = [String::from("Game.exe"), String::from("GAME.EXE")];
+        let images = [(&names[0], 42), (&names[1], 43)];
+        assert_eq!(select_launch_entry(&images, Some("GAME.EXE")).unwrap().1, 43);
+        assert_eq!(select_launch_entry(&images, Some("Game.exe")).unwrap().1, 42);
+        assert!(select_launch_entry(&images, Some("game.exe")).is_err());
+        assert!(select_launch_entry(&[(&names[0], 42), (&names[0], 43)], Some("Game.exe")).is_err());
+        assert_eq!(select_launch_entry(&images, None).unwrap().1, 42);
+    }
+
+    #[tokio::test]
+    async fn plain_launch_entry_never_treats_an_encrypted_or_undeclared_file_as_plaintext() {
+        let root = tempfile::tempdir().unwrap(); let original = fake_pe();
+        std::fs::write(root.path().join("Game.exe"), &original).unwrap();
+        let mut metadata = HashMap::from([(String::from("Game.exe"), SegmentFile { offset: 0, length: original.len() as u64, data_hashs: vec![], keep_encrypted: true })]);
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Game.exe")).await.unwrap().is_none());
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Other.exe")).await.unwrap().is_none());
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, None).await.unwrap().is_none());
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("../Game.exe")).await.is_err());
+        metadata.get_mut("Game.exe").unwrap().keep_encrypted = false;
+        metadata.get_mut("Game.exe").unwrap().length += 1;
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Game.exe")).await.is_err());
+        metadata.get_mut("Game.exe").unwrap().length = original.len() as u64;
+        std::fs::write(root.path().join("Game.exe"), vec![0; original.len()]).unwrap();
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Game.exe")).await.is_err());
+        assert_eq!(std::fs::read(root.path().join("Game.exe")).unwrap(), vec![0; original.len()]);
+    }
+
+    #[tokio::test]
+    async fn plain_launch_entry_rejects_ambiguous_metadata_and_outside_package_links() {
+        let root = tempfile::tempdir().unwrap(); let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Game.exe"), fake_pe()).unwrap();
+        let mut metadata = HashMap::new();
+        for name in ["Game.exe", "GAME.EXE"] { metadata.insert(name.to_owned(), SegmentFile { offset: 0, length: 1024, data_hashs: vec![], keep_encrypted: false }); }
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Game.exe")).await.unwrap().is_some());
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("game.exe")).await.is_err());
+        std::fs::write(outside.path().join("Game.exe"), fake_pe()).unwrap();
+        symlink(outside.path().join("Game.exe"), root.path().join("Outside.exe")).unwrap();
+        metadata.insert("Outside.exe".to_owned(), SegmentFile { offset: 0, length: 1024, data_hashs: vec![], keep_encrypted: false });
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Outside.exe")).await.is_err());
+    }
+
+    #[test]
+    fn launch_directory_falls_back_when_install_filesystem_cannot_create_links() {
+        for code in [nix::libc::EPERM, nix::libc::EOPNOTSUPP, nix::libc::ENOSYS] {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("non-link-filesystem");
+            let fallback = root.path().join("normal temporary filesystem");
+            std::fs::create_dir_all(parent.join("game")).unwrap();
+            std::fs::create_dir(&fallback).unwrap();
+            std::fs::write(parent.join("game/original.bin"), b"unchanged").unwrap();
+            let mut attempts = Vec::new();
+            let result = launch_view_directory_with(&parent.join("game"), &fallback, ".xodus-chain-", |path| {
+                attempts.push(path.to_owned());
+                if path.parent() == Some(parent.as_path()) { return Err(std::io::Error::from_raw_os_error(code)); }
+                probe_launch_view_links(path)
+            }).unwrap();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(result.path().parent(), Some(fallback.as_path()));
+            assert!(!attempts[0].exists());
+            assert_eq!(std::fs::read(parent.join("game/original.bin")).unwrap(), b"unchanged");
+            assert_eq!(std::fs::read_dir(result.path()).unwrap().count(), 0);
+            let path = result.path().to_owned(); drop(result); assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn launch_directory_keeps_supported_install_filesystem_and_cleans_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("game")).unwrap();
+        let directory = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", probe_launch_view_links).unwrap();
+        assert_eq!(directory.path().parent(), Some(root.path()));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(fallback.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn launch_view_is_private_with_a_group_writable_umask() {
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "NEXUS_TEST_PRIVATE_VIEW_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let root = tempfile::tempdir().unwrap();
+            let view = launch_view_directory(root.path().join("game").as_path(), ".xodus-chain-").unwrap();
+            assert_eq!(std::fs::metadata(view.path()).unwrap().permissions().mode() & 0o777, 0o700);
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "commands::run::tests::launch_view_is_private_with_a_group_writable_umask", "--nocapture"]);
+        child.env(CHILD, "1");
+        unsafe { child.pre_exec(|| { nix::libc::umask(0o002); Ok(()) }); }
+        let result = child.output().unwrap();
+        let output = format!("{}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+        assert!(result.status.success(), "{output}");
+        assert!(output.contains("1 passed"), "child must execute the private-view assertion: {output}");
+    }
+
+    #[test]
+    fn launch_directory_falls_back_if_filesystem_ignores_private_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+        let view = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", |path| {
+            calls += 1;
+            if path.parent() == Some(root.path()) {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))?;
+            }
+            probe_launch_view_links(path)
+        }).unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(view.path().parent(), Some(fallback.path()));
+        assert_eq!(std::fs::metadata(view.path()).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn launch_directory_rejects_an_unsafe_fallback_and_cleans_both_views() {
+        let root = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+        let error = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", |path| {
+            calls += 1;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))?;
+            probe_launch_view_links(path)
+        }).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EPERM));
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(fallback.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn launch_directory_does_not_hide_unrelated_io_failures_or_retry_forever() {
+        let root = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("game")).unwrap();
+        let mut calls = 0;
+        let error = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", |_| {
+            calls += 1; Err(std::io::Error::from_raw_os_error(nix::libc::EIO))
+        }).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+        assert_eq!(calls, 1);
+        assert_eq!(std::fs::read_dir(fallback.path()).unwrap().count(), 0);
+        let mut calls = 0;
+        let error = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", |_| {
+            calls += 1; Err(std::io::Error::from_raw_os_error(nix::libc::EPERM))
+        }).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EPERM));
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read_dir(fallback.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn case_resolved_launch_view_keeps_source_files_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("bin/gaming.desktop.x64");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("WITCHER3.EXE"), b"encrypted source fixture").unwrap();
+        let manifest = "bin\\Gaming.Desktop.x64\\witcher3.exe";
+        let relative = resolve_package_file(root.path(), manifest).unwrap();
+        assert_eq!(relative, Path::new("bin/gaming.desktop.x64/WITCHER3.EXE"));
+        let name = relative.to_string_lossy().replace('/', "\\");
+        let mut image = tempfile::tempfile().unwrap();
+        image.write_all(&fake_pe()).unwrap();
+        let files = [(&name, image.as_raw_fd())];
+        assert_eq!(select_launch_entry(&files, Some(manifest)).unwrap().1, image.as_raw_fd());
+        let (mirror, entry, count, _) = create_launch_chain_mirror(root.path(), &name, &files).unwrap();
+        assert_eq!(entry, mirror.path().join(&relative));
+        assert_eq!(std::fs::read(entry).unwrap(), fake_pe());
+        assert_eq!(count, 1);
+        assert_eq!(std::fs::read(nested.join("WITCHER3.EXE")).unwrap(), b"encrypted source fixture");
+    }
+
+    #[test]
+    fn case_resolver_prefers_exact_paths_and_rejects_ambiguity_or_root_escape() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Game.exe"), b"A").unwrap();
+        std::fs::write(root.path().join("GAME.EXE"), b"B").unwrap();
+        assert_eq!(resolve_package_file(root.path(), "Game.exe").unwrap(), Path::new("Game.exe"));
+        assert!(resolve_package_file(root.path(), "game.exe").is_err());
+        assert!(resolve_package_file(root.path(), "..\\Game.exe").is_err());
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("External.exe"), b"outside").unwrap();
+        symlink(outside.path(), root.path().join("External")).unwrap();
+        assert!(resolve_package_file(root.path(), "external/EXTERNAL.exe").is_err());
+    }
+
+    #[test]
+    fn the_runtime_offline_identity_follows_the_license_decision() {
+        assert_eq!(offline_identity_mode(true, false), Some("use"));
+        assert_eq!(offline_identity_mode(true, true), Some("use"));
+        assert_eq!(offline_identity_mode(false, true), Some("store"));
+        // Online without an offline lease (not the designated device, or
+        // offline play turned off): the runtime neither uses nor keeps it.
+        assert_eq!(offline_identity_mode(false, false), None);
+    }
 }

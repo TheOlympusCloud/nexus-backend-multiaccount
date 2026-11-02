@@ -7142,12 +7142,15 @@ dependencies = [
  "bergshamra-c14n",
  "cbc 0.2.1",
  "chrono",
+ "dbus",
  "dbus-secret-service-keyring-store",
  "ed25519-dalek 3.0.0",
+ "fs2",
  "globset",
  "hmac 0.13.0",
  "keyring-core",
  "kryptering",
+ "libc",
  "num-bigint-dig 0.9.1",
  "num-integer",
  "num_enum",
@@ -7166,6 +7169,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "x11-dl",
  "xal",
  "zerocopy",
 ]
@@ -7204,10 +7208,12 @@ dependencies = [
 name = "xodus-service"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
  "console-subscriber",
  "quick-xml 0.42.0",
  "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

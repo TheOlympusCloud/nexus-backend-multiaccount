@@ -1,0 +1,34 @@
+name: Backend source checks
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+permissions:
+  contents: read
+concurrency:
+  group: source-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Read pinned Rust version
+        run: echo "BACKEND_RUST=$(node -p 'require("./build-config.json").rust')" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.BACKEND_RUST }}
+      - name: Install native test libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config libssl-dev protobuf-compiler libdbus-1-dev dbus-daemon libglib2.0-0 tar xz-utils
+      - uses: Swatinem/rust-cache@v2
+      - name: Check source and release contracts
+        run: node --test scripts/ci/*.test.mjs
+      - name: Run account-free native regression tests
+        run: node scripts/test-backend.mjs

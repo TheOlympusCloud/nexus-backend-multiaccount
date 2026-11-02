@@ -1,0 +1,874 @@
+[
+  {
+    "file": "crates/xodus/src/keyring_prompt_window.rs",
+    "name": "keyring_unlock_prompt_uses_only_the_verified_parent_app"
+  },
+  {
+    "file": "crates/xodus/src/keyring_prompt_window.rs",
+    "name": "keyring_unlock_prompt_never_tags_unrelated_or_unparented_windows"
+  },
+  {
+    "file": "crates/xodus/src/keyring_prompt_window.rs",
+    "name": "keyring_unlock_prompt_reaper_id_requires_the_actual_launch_argument"
+  },
+  {
+    "file": "crates/xodus/src/keyring_session_tests.rs",
+    "name": "keyring_session_stop_rejects_unmanaged_process_before_connecting_to_user_bus"
+  },
+  {
+    "file": "crates/xodus/src/keyring_session_tests.rs",
+    "name": "keyring_session_stop_private_bus_rejects_foreign_pid_uid_and_cgroup"
+  },
+  {
+    "file": "crates/xodus/src/keyring_session_tests.rs",
+    "name": "keyring_session_stop_private_bus_never_quits_a_replacement_owner"
+  },
+  {
+    "file": "crates/xodus/src/keyring_session_tests.rs",
+    "name": "keyring_session_stop_private_bus_bounds_unresponsive_and_nonexiting_providers"
+  },
+  {
+    "file": "crates/xodus/src/keyring_persistence_tests.rs",
+    "name": "keyring_persistence_private_bus_foreign_and_absent_provider_are_untouched"
+  },
+  {
+    "file": "crates/xodus/src/keyring_persistence_tests.rs",
+    "name": "keyring_persistence_private_bus_no_creation_unlock_or_extra_authorization"
+  },
+  {
+    "file": "crates/xodus/src/keyring_persistence_tests.rs",
+    "name": "keyring_persistence_private_bus_timeout_denial_and_foreign_signal_never_sync"
+  },
+  {
+    "file": "crates/xodus/src/keyring_persistence_tests.rs",
+    "name": "keyring_persistence_private_bus_replacement_or_lock_race_releases_only_own_handle"
+  },
+  {
+    "file": "crates/xodus/src/keyring_unlock_tests.rs",
+    "name": "keyring_unlock_private_bus_metadata_never_activates_or_reads_items"
+  },
+  {
+    "file": "crates/xodus/src/keyring_unlock_tests.rs",
+    "name": "keyring_unlock_private_bus_prompt_connection_completion_and_lock_recheck"
+  },
+  {
+    "file": "crates/xodus/src/keyring_unlock_tests.rs",
+    "name": "keyring_unlock_private_bus_cancellation_and_timeout_dismiss_the_prompt"
+  },
+  {
+    "file": "crates/xodus/src/keyring_unlock_tests.rs",
+    "name": "keyring_unlock_private_bus_ignores_completion_from_another_owner"
+  },
+  {
+    "file": "crates/xodus/src/keyring_unlock_tests.rs",
+    "name": "keyring_create_never_replaces_existing_collections_or_creates_from_unlock"
+  },
+  {
+    "file": "crates/xodus/src/keyring_unlock_tests.rs",
+    "name": "keyring_create_native_prompt_rechecks_default_and_lock_state"
+  },
+  {
+    "file": "crates/xodus/src/keyring_unlock_tests.rs",
+    "name": "keyring_create_cancel_timeout_and_foreign_completion_are_bounded"
+  },
+  {
+    "file": "crates/xodus/src/hardware.rs",
+    "name": "smbios_missing_table_does_not_start_pkexec"
+  },
+  {
+    "file": "crates/xodus/src/licensing/content_response_tests.rs",
+    "name": "content_ticket_content_request_preserves_jwe_and_other_license_fields"
+  },
+  {
+    "file": "crates/xodus/src/licensing/content_response_tests.rs",
+    "name": "content_license_request_contract_is_unchanged"
+  },
+  {
+    "file": "crates/xodus/src/licensing/content_response_tests.rs",
+    "name": "content_license_device_limit_http_is_not_an_http501_and_never_retries"
+  },
+  {
+    "file": "crates/xodus/src/licensing/content_response_tests.rs",
+    "name": "content_license_malformed_keys_are_errors_not_panics"
+  },
+  {
+    "file": "crates/xodus/src/models/licensing_ticket_tests.rs",
+    "name": "content_ticket_jwe_is_bare_only_at_the_licensing_boundary"
+  },
+  {
+    "file": "crates/xodus/src/models/licensing_ticket_tests.rs",
+    "name": "content_ticket_opaque_compact_and_delegation_forms_stay_byte_exact"
+  },
+  {
+    "file": "crates/xodus/src/models/licensing_ticket_tests.rs",
+    "name": "content_ticket_dotted_or_malformed_values_are_not_reinterpreted_as_jwe"
+  },
+  {
+    "file": "crates/xodus/src/models/licensing_ticket_tests.rs",
+    "name": "xbox_delegation_ticket_prefix_follows_the_ticket_encoding"
+  },
+  {
+    "file": "crates/xodus/src/models/secrets.rs",
+    "name": "credential_token_response_valid_compact_delegation_and_legacy_remain_supported"
+  },
+  {
+    "file": "crates/xodus/src/tokens/credential_tests.rs",
+    "name": "credential_login_session_readback_failure_never_exposes_mixed_account_and_token"
+  },
+  {
+    "file": "crates/xodus/src/tokens/credential_tests.rs",
+    "name": "credential_login_session_failed_write_preserves_previous_session_and_empty_set_is_refused"
+  },
+  {
+    "file": "crates/xodus/src/tokens/credential_tests.rs",
+    "name": "credential_invalid_device_proof_returns_an_error_before_any_request"
+  },
+  {
+    "file": "crates/xodus/src/tokens/credential_concurrency_tests.rs",
+    "name": "credential_concurrent_token_merges_preserve_both_addresses"
+  },
+  {
+    "file": "crates/xodus/src/tokens/credential_concurrency_tests.rs",
+    "name": "credential_session_replacement_waits_for_in_progress_mutation"
+  },
+  {
+    "file": "crates/xodus/src/tokens/credential_concurrency_tests.rs",
+    "name": "credential_logout_waits_for_in_progress_mutation"
+  },
+  {
+    "file": "crates/xodus/src/tokens/credential_concurrency_tests.rs",
+    "name": "credential_failed_update_releases_transaction_for_retry"
+  },
+  {
+    "file": "crates/xodus/src/tokens/manager.rs",
+    "name": "credential_account_metadata_snapshot_is_atomic_and_logout_removes_it"
+  },
+  {
+    "file": "crates/xodus/src/tokens/manager.rs",
+    "name": "credential_account_metadata_never_pairs_different_sessions_under_concurrent_reads"
+  },
+  {
+    "file": "crates/xodus/src/tokens/transaction.rs",
+    "name": "credential_separate_processes_preserve_all_token_merges"
+  },
+  {
+    "file": "crates/xodus/src/tokens/transaction.rs",
+    "name": "credential_process_lock_is_bounded_and_released_after_kill"
+  },
+  {
+    "file": "crates/xodus/src/tokens/transaction.rs",
+    "name": "credential_process_lock_rejects_unsafe_paths_without_touching_targets"
+  },
+  {
+    "file": "crates/xodus/src/tokens/transaction.rs",
+    "name": "credential_stale_response_is_rejected_after_another_process_changes_session"
+  },
+  {
+    "file": "crates/xodus/src/tokens/user_snapshot.rs",
+    "name": "credential_snapshot_rejects_logout_account_switch_and_identical_relogin"
+  },
+  {
+    "file": "crates/xodus/src/tokens/user_snapshot.rs",
+    "name": "credential_snapshot_does_not_overwrite_newer_refresh_in_same_session"
+  },
+  {
+    "file": "crates/xodus/src/tokens/user_snapshot.rs",
+    "name": "credential_snapshot_legacy_tombstone_prevents_identical_relogin_aba"
+  },
+  {
+    "file": "crates/xodus/src/tokens/user_snapshot.rs",
+    "name": "credential_snapshot_storage_failures_do_not_publish_or_advance_credentials"
+  },
+  {
+    "file": "crates/xodus/src/auth/sisu_response_tests.rs",
+    "name": "credential_sisu_selects_compact_and_refresh_tokens_independently_of_response_order"
+  },
+  {
+    "file": "crates/xodus/src/auth/sisu_response_tests.rs",
+    "name": "credential_sisu_keeps_jwe_opaque_and_single_response_ticket_formats"
+  },
+  {
+    "file": "crates/xodus/src/auth/sisu_response_tests.rs",
+    "name": "credential_sisu_rejects_missing_duplicate_unknown_and_malformed_tokens_without_payload_errors"
+  },
+  {
+    "file": "crates/xodus/src/auth/sisu_response_tests.rs",
+    "name": "credential_sisu_checks_all_expiries_and_selects_the_ticket_lifetime"
+  },
+  {
+    "file": "crates/xodus/src/api/live/mod.rs",
+    "name": "ticket_diagnostic_classifies_without_disclosing_error_payloads"
+  },
+  {
+    "file": "crates/xodus/src/api/live/device_response_tests.rs",
+    "name": "credential_device_response_accepts_complete_registration_without_rewriting_identity"
+  },
+  {
+    "file": "crates/xodus/src/api/live/device_response_tests.rs",
+    "name": "credential_device_response_http_refusals_are_errors_not_panics_or_payload_logs"
+  },
+  {
+    "file": "crates/xodus/src/api/live/device_response_tests.rs",
+    "name": "credential_device_response_rejects_malformed_incomplete_and_unsuccessful_payloads"
+  },
+  {
+    "file": "crates/xodus/src/api/live/device_response_tests.rs",
+    "name": "credential_device_response_bounds_bodies_with_or_without_content_length"
+  },
+  {
+    "file": "crates/xodus/src/api/xbox/auth.rs",
+    "name": "xbox_delegation_ticket_reaches_the_real_user_request_without_an_extra_prefix"
+  },
+  {
+    "file": "crates/xodus-service/src/store_license.rs",
+    "name": "store_license_accepts_delegation_compact_user_tickets"
+  },
+  {
+    "file": "crates/xodus-service/src/store_license.rs",
+    "name": "store_license_jwe_keeps_existing_request_and_opaque_ticket_behavior"
+  },
+  {
+    "file": "crates/xodus-service/src/account_metadata.rs",
+    "name": "account_metadata_uses_real_session_ids_and_rejects_mixed_accounts"
+  },
+  {
+    "file": "crates/xodus-service/src/account_metadata.rs",
+    "name": "account_metadata_rejects_placeholder_malformed_and_empty_ids"
+  },
+  {
+    "file": "crates/xodus-service/src/account_metadata.rs",
+    "name": "account_metadata_xml_is_additive_and_omitted_for_unbound_sessions"
+  },
+  {
+    "file": "crates/xodus-service/src/simple_context.rs",
+    "name": "pooled_transport_reuses_connections_without_carrying_credentials"
+  },
+  {
+    "file": "crates/xodus-service/src/simple_context.rs",
+    "name": "separate_transports_reproduce_the_previous_connection_overhead"
+  },
+  {
+    "file": "crates/xodus-service/src/simple_context.rs",
+    "name": "http_deadline_covers_headers"
+  },
+  {
+    "file": "crates/xodus-service/src/simple_context.rs",
+    "name": "http_deadline_covers_body"
+  },
+  {
+    "file": "crates/xodus-service/src/simple_context.rs",
+    "name": "http_deadline_does_not_restart_for_each_chunk"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/router.rs",
+    "name": "deadline_covers_partial_magic"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/router.rs",
+    "name": "deadline_covers_partial_header"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/router.rs",
+    "name": "deadline_covers_partial_body"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/router.rs",
+    "name": "cancellation_interrupts_pending_read"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/router.rs",
+    "name": "complete_ping_preserves_framing"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/xml.rs",
+    "name": "token_response_selects_types_in_both_orders"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/xml.rs",
+    "name": "token_response_invalid_expiry_does_not_replace_credentials"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/xml.rs",
+    "name": "token_response_ambiguous_reply_does_not_replace_credentials"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/xml.rs",
+    "name": "token_response_rejects_incomplete_replies_before_persistence"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/xml.rs",
+    "name": "token_response_single_ticket_keeps_existing_refresh_credential"
+  },
+  {
+    "file": "crates/xodus-service/src/connection/xml.rs",
+    "name": "token_response_stale_session_never_returns_a_ticket_or_changes_credentials"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan_http_tests.rs",
+    "name": "premium_http_only_reads_declared_bundle_members"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan_http_tests.rs",
+    "name": "premium_http_reports_exact_status_without_exposing_response_body"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan_http_tests.rs",
+    "name": "premium_unavailable_declared_member_still_stops_resolution"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan_http_tests.rs",
+    "name": "premium_nested_bundles_keep_real_addon_choices_and_explicit_selection"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan_http_tests.rs",
+    "name": "premium_bundle_depth_and_product_limits_still_fail_closed"
+  },
+  {
+    "file": "crates/xodus-cli/src/webview_stdio.rs",
+    "name": "hosted_signin_transport_emits_complete_headers_on_the_second_leg"
+  },
+  {
+    "file": "crates/xodus-cli/src/webview_host_tests.rs",
+    "name": "hosted_signin_both_legs_keep_all_nine_headers_and_exact_targets"
+  },
+  {
+    "file": "crates/xodus-cli/src/webview_host_tests.rs",
+    "name": "hosted_signin_correlation_is_a_fresh_uuid_for_every_request"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan.rs",
+    "name": "package_storage_estimates_are_optional_positive_and_bound_to_the_selected_content"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan.rs",
+    "name": "package_storage_estimates_merge_retail_duplicates_without_using_trial_or_foreign_sizes"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan.rs",
+    "name": "durable_pc_package_requires_explicit_selection_and_verified_parent_metadata"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan.rs",
+    "name": "durable_missing_foreign_or_ambiguous_parent_and_non_pc_formats_stay_unsupported"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan.rs",
+    "name": "durable_entitlement_back_references_do_not_form_bundle_cycles"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan.rs",
+    "name": "premium_entitlement_links_do_not_walk_back_to_parent_or_foreign_games"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan.rs",
+    "name": "premium_license_only_addon_never_selects_a_game_that_grants_it"
+  },
+  {
+    "file": "crates/xodus-cli/src/package_plan.rs",
+    "name": "premium_game_entitlement_is_not_bundle_membership_either"
+  },
+  {
+    "file": "crates/xodus-cli/src/installation_state.rs",
+    "name": "streaming_update_barrier_survives_failure_and_clears_only_after_metadata_commit"
+  },
+  {
+    "file": "crates/xodus-cli/src/installation_state.rs",
+    "name": "streaming_update_launch_preserves_read_only_and_unsupported_lock_installations"
+  },
+  {
+    "file": "crates/xodus-cli/src/installation_state.rs",
+    "name": "streaming_update_actual_run_refuses_incomplete_installation_before_game_or_account_access"
+  },
+  {
+    "file": "crates/xodus-cli/src/license.rs",
+    "name": "switching_the_designation_from_a_to_b_ends_offline_play_on_a_when_it_reconnects"
+  },
+  {
+    "file": "crates/xodus-cli/src/license.rs",
+    "name": "expired_leases_fail_closed_and_disappear"
+  },
+  {
+    "file": "crates/xodus-cli/src/license.rs",
+    "name": "an_account_change_removes_every_stored_license"
+  },
+  {
+    "file": "crates/xodus-cli/src/license.rs",
+    "name": "explicit_licensing_refusals_remove_stored_licenses"
+  },
+  {
+    "file": "crates/xodus-cli/src/license.rs",
+    "name": "the_device_registration_is_identified_even_without_a_license_device_id"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "lease_restrictions_come_from_the_lease_microsoft_issued"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "lease_dates_are_read_in_the_formats_microsoft_uses"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "expired_leases_are_refused_and_removed_whatever_the_local_file_claims"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "a_swapped_lease_document_is_validated_again"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "offline_cache_authenticates_every_policy_field_and_requires_the_same_private_registration"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "offline_revocation_remains_closed_when_any_previous_entry_cannot_be_removed"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "offline_lease_cannot_extend_a_trial_or_start_before_either_server_validity_window"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "offline_cache_never_reads_or_writes_through_a_root_or_entry_symlink"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "a_clock_set_back_cannot_stretch_offline_use"
+  },
+  {
+    "file": "crates/xodus-cli/src/license_cache_tests.rs",
+    "name": "another_account_or_device_registration_removes_every_stored_license"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/session.rs",
+    "name": "ticket_fault_classification_and_provider_codes_are_strictly_bounded"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/session.rs",
+    "name": "ticket_real_transport_timeout_and_http_refusal_classification"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/subscription.rs",
+    "name": "store_ticket_accepts_compact_and_delegation_compact_forms"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/library.rs",
+    "name": "positron_provenance_is_explicit_boolean_and_never_copied_from_untrusted_fields"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/library.rs",
+    "name": "conflicting_positron_and_unknown_special_rows_quarantine_their_children"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/library.rs",
+    "name": "positron_normalized_protocol_fixture"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social.rs",
+    "name": "social_empty_conversation_can_omit_participants_without_inventing_messages_or_identity"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social.rs",
+    "name": "social_input_rejects_arbitrary_endpoints_and_invalid_ids_before_authentication"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social.rs",
+    "name": "social_plans_use_only_exact_https_hosts_and_no_retry_or_identity_impersonation"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social.rs",
+    "name": "social_friends_keep_unknown_presence_honest_and_drop_private_server_fields"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social.rs",
+    "name": "social_friend_picture_is_optional_and_only_uses_exact_trusted_image_hosts"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social.rs",
+    "name": "social_chat_preserves_safety_filters_and_never_fetches_media"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social.rs",
+    "name": "social_send_success_requires_actual_service_acknowledgement"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social.rs",
+    "name": "social_http_uses_one_explicit_request_and_honors_denials_without_retry"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social.rs",
+    "name": "social_http_accepts_empty_thread_without_participants_and_never_posts_a_read_marker"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social_session.rs",
+    "name": "chat_session_policy_lookup_keeps_stdout_machine_readable"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social_session.rs",
+    "name": "chat_session_quiet_audience_matches_pinned_policy_selection_without_fallback"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social_session.rs",
+    "name": "chat_session_signature_preserves_exact_bytes_and_rejects_tampering"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social_session.rs",
+    "name": "chat_session_issued_tickets_keep_the_server_type_and_require_fresh_lifetimes"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social_session.rs",
+    "name": "chat_session_xsts_requires_one_real_user_communications_and_unexpired_token"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social_session.rs",
+    "name": "chat_session_writes_require_atomic_identity_and_reject_same_name_different_principal"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/social_session.rs",
+    "name": "chat_session_post_is_signed_once_without_retries_redirects_or_error_payloads"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_preflight_tests.rs",
+    "name": "streaming_repair_selection_preserves_unchanged_files_and_only_targets_current_package"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_preflight_tests.rs",
+    "name": "streaming_metadata_failure_returns_error_without_panic_or_touching_existing_game"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_failure.rs",
+    "name": "streaming_failure_cancels_and_settles_parallel_workers_without_completing_failed_jobs"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_failure.rs",
+    "name": "streaming_failure_preserves_existing_game_and_dlc_files_and_completed_marker"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social_session.rs",
+    "name": "chat_session_policy_lookup_keeps_stdout_machine_readable"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social_session.rs",
+    "name": "chat_session_quiet_audience_matches_pinned_policy_selection_without_fallback"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social_session.rs",
+    "name": "chat_session_signature_preserves_exact_bytes_and_rejects_tampering"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social_session.rs",
+    "name": "chat_session_issued_tickets_keep_the_server_type_and_require_fresh_lifetimes"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social_session.rs",
+    "name": "chat_session_xsts_requires_one_real_user_communications_and_unexpired_token"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social_session.rs",
+    "name": "chat_session_writes_require_atomic_identity_and_reject_same_name_different_principal"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social_session.rs",
+    "name": "chat_session_post_is_signed_once_without_retries_redirects_or_error_payloads"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social.rs",
+    "name": "native_conversation_binds_both_users_network_and_unique_ordered_messages"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social.rs",
+    "name": "native_message_filtering_fails_closed_and_does_not_truncate_identifiers"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/native_social.rs",
+    "name": "native_inbox_keeps_explicit_unread_state_and_rejects_cross_account_or_duplicate_rows"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_resume.rs",
+    "name": "streaming_resume_completed_encrypted_image_preserves_ciphertext_tail"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_resume.rs",
+    "name": "streaming_updated_file_is_trimmed_even_when_its_expected_length_is_zero_or_complete"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_resume.rs",
+    "name": "streaming_resume_repairs_old_encrypted_tail_with_actual_range_download"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_resume.rs",
+    "name": "streaming_resume_synced_proof_binds_exact_output_and_preserves_legacy_journal"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_resume.rs",
+    "name": "streaming_resume_streamed_identity_is_byte_compatible_and_binds_every_layout_field"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_resume.rs",
+    "name": "streaming_resume_shared_identity_reopens_legacy_checkpoints_in_both_roots"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update.rs",
+    "name": "streaming_update_completed_never_skips_zero_length_or_oversized_replacements"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update.rs",
+    "name": "streaming_update_recovery_rechecks_old_metadata_and_preserves_optional_placeholders"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update.rs",
+    "name": "streaming_update_interrupted_multifile_commit_remains_blocked_until_recovery_finishes"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update.rs",
+    "name": "streaming_update_reuses_complete_ciphertext_tail_on_initial_and_resumed_updates"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update.rs",
+    "name": "streaming_update_reuses_relocated_pages_and_downloads_modified_or_corrupt_pages_only"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_pipeline_builds_relocation_index_only_when_needed"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_pipeline_overlaps_but_settles_current_write_before_lookahead_failure"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_pipeline_write_failure_cancels_lookahead_without_detached_work"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_pipeline_checkpoint_failure_is_not_retried"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_pipeline_pause_keeps_lookahead_out_of_progress_and_resume_checkpoint"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_throughput_prefers_same_position_and_reads_contiguous_pages_once"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_throughput_ranges_cover_all_gaps_once_with_bounded_memory"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_throughput_parallel_ranges_preserve_plain_and_ciphertext_tails"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_throughput_failed_window_resumes_only_durable_contiguous_output"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/streaming_update_throughput_tests.rs",
+    "name": "streaming_update_throughput_pause_and_cancellation_never_claim_prefetched_bytes"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/offline_pc.rs",
+    "name": "stored_offline_licenses_end_when_this_device_is_not_or_no_longer_designated"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "dlc_workspace_unrelated_child_does_not_keep_workspace_alive"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "dlc_workspace_failed_launch_releases_owned_descriptor"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_image_preflight_rejects_incomplete_ciphertext_with_file_and_size_without_writing"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_image_preflight_accepts_valid_plain_and_padded_images_without_changes"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_images_keep_owned_descriptors_with_inheritance_enabled"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_sweep_removes_views_whose_session_is_gone"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_lock_is_inherited_by_the_game"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_sweep_skips_locks_that_are_not_files"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_sweep_keeps_views_a_running_session_holds"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_sweep_cleans_the_temp_dir_fallback"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_sweep_keeps_orphan_locks_still_held"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_sweep_preserves_lockless_views_regardless_of_age"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_lock_failure_keeps_launching_and_never_sweeps_the_live_view"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_failed_lock_preparation_never_publishes_an_unheld_lock"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_lock_publication_never_replaces_an_existing_lock"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_sweep_keeps_old_views_with_invalid_locks"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_sweep_keeps_concurrent_live_sessions"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_view_child_holds_lock_after_owner_is_killed"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "plain_launch_entry_uses_only_declared_package_images_and_preserves_sources"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "plain_region_metadata_declares_selected_executable_without_replacing_encrypted_files"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "plain_region_metadata_empty_read_preserves_all_existing_declarations"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "plain_region_metadata_keeps_path_signature_and_ambiguity_checks"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_entry_prefers_exact_case_and_refuses_ambiguous_case_fallbacks"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "plain_launch_entry_never_treats_an_encrypted_or_undeclared_file_as_plaintext"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "plain_launch_entry_rejects_ambiguous_metadata_and_outside_package_links"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_directory_falls_back_when_install_filesystem_cannot_create_links"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_directory_keeps_supported_install_filesystem_and_cleans_probe"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "launch_directory_does_not_hide_unrelated_io_failures_or_retry_forever"
+  },
+  {
+    "file": "crates/xodus-cli/src/commands/run.rs",
+    "name": "the_runtime_offline_identity_follows_the_license_decision"
+  },
+  {
+    "file": "crates/msixvc/src/download_resume_tests.rs",
+    "name": "streaming_resume_terminal_http_error_checkpoints_only_written_pages_then_restarts_exactly"
+  },
+  {
+    "file": "crates/msixvc/src/streaming_http_tests.rs",
+    "name": "streaming_http_disk_or_consumer_delay_is_not_network_idle_time"
+  },
+  {
+    "file": "crates/msixvc/src/streaming_http_tests.rs",
+    "name": "streaming_http_production_timeout_tolerates_a_six_second_slow_response"
+  },
+  {
+    "file": "crates/msixvc/src/streaming_metadata_tests.rs",
+    "name": "streaming_metadata_header_and_body_waits_have_deadlines"
+  },
+  {
+    "file": "crates/msixvc/src/streaming_metadata_tests.rs",
+    "name": "streaming_metadata_empty_reconnects_stop_after_retry_limit"
+  },
+  {
+    "file": "crates/msixvc/src/bandwidth.rs",
+    "name": "streaming_bandwidth_cached_prefix_handoff_does_not_park_the_limiter"
+  },
+  {
+    "file": "crates/msixvc/src/bandwidth.rs",
+    "name": "streaming_bandwidth_limited_http_metadata_and_parallel_ranges_keep_bytes_and_do_not_timeout"
+  },
+  {
+    "file": "crates/msixvc/src/bandwidth.rs",
+    "name": "streaming_bandwidth_is_aggregate_across_parallel_streams"
+  },
+  {
+    "file": "crates/msixvc/src/bandwidth.rs",
+    "name": "streaming_bandwidth_update_and_unlimited_wake_active_waiters"
+  },
+  {
+    "file": "crates/msixvc/src/bandwidth.rs",
+    "name": "streaming_bandwidth_cancellation_leaves_no_reserved_delay"
+  },
+  {
+    "file": "crates/msixvc/src/download_throughput_tests.rs",
+    "name": "streaming_throughput_batches_page_writes_without_changing_plain_bytes_or_short_writes"
+  },
+  {
+    "file": "crates/msixvc/src/streaming_hash_cache.rs",
+    "name": "streaming_hash_cache_full_xvd_parser_preserves_every_hash_and_encryption_unit"
+  },
+  {
+    "file": "crates/msixvc/src/streaming_hash_cache.rs",
+    "name": "streaming_hash_cache_batches_strided_reads_and_preserves_backward_and_boundary_bytes"
+  },
+  {
+    "file": "crates/msixvc/src/streaming_hash_cache.rs",
+    "name": "streaming_hash_cache_never_reads_beyond_declared_section_or_accepts_truncated_data"
+  },
+  {
+    "file": "crates/msixvc/src/streaming_hash_cache.rs",
+    "name": "streaming_hash_cache_cancelled_fill_is_never_reused"
+  },
+  {
+    "file": "crates/msixvc/src/crypt.rs",
+    "name": "batched_xts_matches_scalar_reference_for_keys_units_and_both_directions"
+  },
+  {
+    "file": "crates/msixvc/src/crypt.rs",
+    "name": "xts_ciphertext_matches_independent_openssl_vector"
+  },
+  {
+    "file": "crates/msixvc/src/encrypted_image_tests.rs",
+    "name": "streaming_throughput_decrypts_large_batches_with_exact_unpadded_plaintext"
+  },
+  {
+    "file": "crates/msixvc/src/encrypted_image_tests.rs",
+    "name": "streaming_encrypted_download_and_partial_resume_keep_exact_ciphertext_for_launch_decryption"
+  },
+  {
+    "file": "crates/msixvc/src/encrypted_image_tests.rs",
+    "name": "streaming_plain_output_remains_unpadded_and_short_ciphertext_returns_error"
+  },
+  {
+    "file": "crates/msixvc/src/encrypted_image_tests.rs",
+    "name": "streaming_update_verifier_checks_licensed_plaintext_ciphertext_wrong_keys_and_modified_pages"
+  }
+]

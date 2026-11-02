@@ -1,3 +1,6 @@
 /target
 .env
 samples
+
+/backend-build
+/backend-release

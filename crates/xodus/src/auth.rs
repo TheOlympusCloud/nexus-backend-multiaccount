@@ -15,6 +15,51 @@ use crate::models::secrets::Token;
 use crate::models::soap;
 use crate::tokens::TokenManager;
 
+type RefreshedUserToken = (String, Token);
+
+/// Validated token types and expiry fields, including an optional refresh credential. Selection is
+/// shared by the CLI and service so response ordering cannot change token roles.
+pub struct IssuedUserTokens {
+    pub token: String,
+    pub expiry: i64,
+    pub refreshed: Option<(String, Token)>,
+}
+
+pub fn issued_user_tokens(outcome: ExchangeUserTokenOutcome) -> Result<IssuedUserTokens, crate::models::secrets::InvalidTokenResponse> {
+    use crate::models::secrets::InvalidTokenResponse;
+    let responses = match outcome {
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) => collection.security_tokens,
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(response)) => vec![*response],
+        _ => return Err(InvalidTokenResponse),
+    };
+    let mut compact = None;
+    let mut refreshed = None;
+    for response in responses {
+        let address = response.applies_to.endpoint_reference.address.clone();
+        let expiry = chrono::DateTime::parse_from_rfc3339(&response.lifetime.expires)
+            .map_err(|_| InvalidTokenResponse)?.timestamp();
+        match Token::try_from(response)? {
+            Token::Compact(value) if compact.is_none() && !value.is_empty() && !matches!(value.as_str(), "d=" | "t=") => compact = Some((value, expiry)),
+            Token::Legacy(value) if refreshed.is_none() => {
+                let address = value.key_name.clone().unwrap_or(address);
+                if address.trim().is_empty() { return Err(InvalidTokenResponse); }
+                refreshed = Some((address, Token::Legacy(value)));
+            }
+            _ => return Err(InvalidTokenResponse),
+        }
+    }
+    let (token, expiry) = compact.ok_or(InvalidTokenResponse)?;
+    Ok(IssuedUserTokens { token, expiry, refreshed })
+}
+
+fn sisu_user_tokens(outcome: ExchangeUserTokenOutcome) -> Result<(String, Option<RefreshedUserToken>), crate::models::secrets::InvalidTokenResponse> {
+    let selected = issued_user_tokens(outcome)?;
+    Ok((selected.token, selected.refreshed))
+}
+
+#[cfg(test)]
+mod sisu_response_tests;
+
 fn get_app_params() -> XalAppParameters {
     XalAppParameters {
         client_id: "000000004424da1f".to_string(),
@@ -80,7 +125,8 @@ pub async fn do_sisu(
     ),
     Box<dyn std::error::Error>,
 > {
-    let Token::Legacy(token) = manager.get_user_sts_token()? else {
+    let mut snapshot = manager.user_token_snapshot()?;
+    let Token::Legacy(token) = snapshot.token() else {
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "error",
@@ -103,7 +149,7 @@ pub async fn do_sisu(
         )
         .await?;
 
-    let Token::Compact(ms_device_token) = device_token_resp.into() else {
+    let Token::Compact(ms_device_token) = Token::try_from(device_token_resp)? else {
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "error",
@@ -128,36 +174,8 @@ pub async fn do_sisu(
     )
     .await?;
 
-    let ExchangeUserTokenOutcome::Issued(
-        soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
-    ) = user_token
-    else {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "error",
-        )));
-    };
-
-    if let Some(sts) = collection.security_tokens.pop() {
-        let address = sts.applies_to.endpoint_reference.address.clone();
-        let sts: Token = sts.into();
-        let address = if let Token::Legacy(legacy) = &sts {
-            legacy.key_name.clone().unwrap_or(address)
-        } else {
-            address
-        };
-        if let Err(err) = manager.save_user_token(address, sts) {
-            tracing::warn!("Failed to persist refreshed STS token: {err}");
-        }
-    }
-    let token: soap::RequestSecurityTokenResponse = collection.security_tokens.remove(0);
-    let token: Token = token.into();
-    let Token::Compact(user_token) = token else {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "error",
-        )));
-    };
+    let (user_token, refreshed) = sisu_user_tokens(user_token)?;
+    manager.accept_user_token_refresh(&mut snapshot, refreshed)?;
 
     let mut auth = XalAuthenticator::new(
         XalAppParameters {
@@ -181,8 +199,8 @@ pub async fn do_sisu(
         .await?;
     let resp = auth
         .sisu_authorize_rps(&user_token, &data.token, None)
-        .await
-        .expect("ok");
+        .await?;
+    manager.validate_user_token_snapshot(&snapshot)?;
     Ok((auth, resp, data))
 }
 

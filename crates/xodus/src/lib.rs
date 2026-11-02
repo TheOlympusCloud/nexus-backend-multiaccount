@@ -2,6 +2,12 @@ pub mod api;
 pub mod auth;
 pub mod clep;
 pub mod hardware;
+#[cfg(target_os = "linux")]
+mod keyring_persistence;
+#[cfg(target_os = "linux")]
+pub mod keyring_session;
+#[cfg(target_os = "linux")]
+pub mod keyring_unlock;
 pub mod licensing;
 pub mod models;
 pub mod secrets;

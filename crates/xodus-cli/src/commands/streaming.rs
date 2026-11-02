@@ -15,11 +15,51 @@ use uuid::Uuid;
 use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
-use crate::package::{get_content_id, get_packages};
+use crate::package::get_packages;
+
+#[path = "streaming_progress.rs"]
+mod progress;
+#[path = "streaming_resume.rs"]
+mod resume;
+#[path = "streaming_failure.rs"]
+mod failure;
+#[path = "streaming_update.rs"]
+mod update;
+
+#[cfg(test)]
+#[path = "streaming_preflight_tests.rs"]
+mod preflight_tests;
 
 struct Job {
     name: String,
     content: SegmentFile,
+}
+
+fn pending_files<'a>(
+    root: &Path,
+    remote: &'a HashMap<String, SegmentFile>,
+    local: &HashMap<String, SegmentFile>,
+) -> std::io::Result<Vec<(&'a String, &'a SegmentFile)>> {
+    let mut pending = Vec::new();
+    for (name, file) in remote {
+        let unchanged = local.get(name).is_some_and(|old| {
+            !file.data_hashs.is_empty() && file.data_hashs == old.data_hashs
+                && file.length == old.length && file.keep_encrypted == old.keep_encrypted
+        });
+        let needs_repair = if unchanged && file.keep_encrypted {
+            // Matching package metadata alone does not prove that the on-disk
+            // ciphertext still includes the full final page.
+            let target = resume::target(root, name)?;
+            match std::fs::metadata(target) {
+                Ok(metadata) if metadata.is_file() => metadata.len() < file.stored_length()?,
+                Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "package image is not a regular file")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error),
+            }
+        } else { false };
+        if !unchanged || needs_repair { pending.push((name, file)); }
+    }
+    Ok(pending)
 }
 
 enum ProgressEvent {
@@ -28,6 +68,9 @@ enum ProgressEvent {
     Finished { id: usize },
     UpdateRemaining { name: String, total: u64 },
     UpdateStatus { name: String },
+    Paused { paused: bool },
+    Completed { success: bool },
+    Traffic { network: u64, reused: u64 },
 }
 
 pub async fn run(
@@ -38,8 +81,16 @@ pub async fn run(
     try_skip_ntfs: bool,
     parallel: Option<usize>,
     market: Option<String>,
+    progress_json: bool,
+    control_stdin: bool,
+    selected_content_id: Option<String>,
 ) -> ExitCode {
+    if selected_content_id.is_some() && (Uuid::try_parse(&source).is_ok() || source.contains("://")) {
+        eprintln!("Package selection requires a Store product ID");
+        return ExitCode::FAILURE;
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+    let pause = progress::controls(control_stdin, tx.clone());
     if source.starts_with("file://") {
         let fsrc = source.strip_prefix("file://").unwrap_or_default();
         let f = match File::open(fsrc).await {
@@ -56,7 +107,7 @@ pub async fn run(
                 return ExitCode::FAILURE;
             }
         };
-        run_cli_reader(
+        return run_cli_reader(
             client,
             tokens,
             destination,
@@ -68,6 +119,8 @@ pub async fn run(
             &source,
             &tx,
             rx,
+            progress_json,
+            pause,
         )
         .await;
     } else {
@@ -75,7 +128,12 @@ pub async fn run(
             source
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
-                let content_id_task = get_content_id(client, source, market.clone()).await;
+                let region = market.clone().unwrap_or("US".into()).to_uppercase();
+                let content_id_task = match crate::package_plan::resolve(client, &source.to_uppercase(), &region).await {
+                    Ok(plan) => if selected_content_id.is_some() { plan.select(selected_content_id.as_deref()) }
+                        else { plan.without_durable_selection().select(None) },
+                    Err(error) => Err(error),
+                };
                 let Ok(content_id) = content_id_task else {
                     let Err(err) = content_id_task else {
                         eprintln!("Unknown Error");
@@ -105,15 +163,18 @@ pub async fn run(
                 eprintln!("No .msixvc file found");
                 return ExitCode::FAILURE;
             };
+            let Some(root) = file.cdn_root_paths.first() else {
+                eprintln!("Microsoft returned no package download location."); return ExitCode::FAILURE;
+            };
             format!(
                 "{}{}",
-                file.cdn_root_paths.first().unwrap(),
+                root,
                 file.relative_url
             )
         };
         let url = &vurl;
         let mut pos = 0;
-        let http_file = streaming::HttpRead::open(
+        let http_file = match streaming::HttpRead::open(
             client.clone(),
             url,
             Some(|c, _| {
@@ -128,11 +189,13 @@ pub async fn run(
                 }
             }),
         )
-        .await
-        .expect("ok");
+        .await {
+            Ok(file) => file,
+            Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+        };
         let l = http_file.len();
 
-        run_cli_reader(
+        return run_cli_reader(
             client,
             tokens,
             destination,
@@ -144,11 +207,11 @@ pub async fn run(
             url,
             &tx,
             rx,
+            progress_json,
+            pause,
         )
         .await;
     }
-
-    ExitCode::SUCCESS
 }
 
 async fn run_cli_reader<Reader>(
@@ -163,11 +226,17 @@ async fn run_cli_reader<Reader>(
     url: &str,
     tx: &Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
-) -> ()
+    progress_json: bool,
+    pause: tokio::sync::watch::Receiver<bool>,
+) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
 {
-    tokio::spawn(async move {
+    let reporter = tokio::spawn(async move {
+        if progress_json {
+            progress::report(rx).await;
+            return;
+        }
         let multi_progress = MultiProgress::new();
         let total_progess = multi_progress.add(ProgressBar::new(l).with_style(
             ProgressStyle::with_template("{msg:30!} {bytes:>12}/{total_bytes:>12} {bytes_per_sec:>12} [{bar:40.cyan/blue}] {percent:>3}%").unwrap()
@@ -205,12 +274,14 @@ where
                 ProgressEvent::UpdateStatus { name } => {
                     total_progess.set_message(name);
                 }
+                ProgressEvent::Paused { .. } | ProgressEvent::Traffic { .. } => {}
+                ProgressEvent::Completed { .. } => break,
             }
         }
 
         total_progess.abandon();
     });
-    run_reader(
+    let code = run_reader(
         client,
         tokens,
         destination,
@@ -221,8 +292,18 @@ where
         l,
         url,
         tx,
+        pause,
     )
+    .await;
+    tx.send(ProgressEvent::Completed {
+        success: code == ExitCode::SUCCESS,
+    })
     .await
+    .ok();
+    if reporter.await.is_err() {
+        return ExitCode::FAILURE;
+    }
+    code
 }
 
 async fn run_reader<Reader>(
@@ -236,34 +317,56 @@ async fn run_reader<Reader>(
     l: u64,
     url: &str,
     tx: &Sender<ProgressEvent>,
-) -> ()
+    pause: tokio::sync::watch::Receiver<bool>,
+) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
 {
     let out: &Path = Path::new(&destination);
 
-    std::fs::create_dir_all(out).expect("ok");
+    if let Err(error) = std::fs::create_dir_all(out) {
+        failure::report(&error); return ExitCode::FAILURE;
+    }
+    let _folder_lock = match resume::lock(out) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("Cannot start this download: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
     let final_path = out.join(".xodus-streaming.msixvc");
 
-    let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
-        .await
-        .expect("no err");
-    let remote_xvd = XvdFile::parse(&mut remote_file).await.expect("no err");
+    let mut remote_file = match streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await {
+        Ok(file) => file,
+        Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+    };
+    let remote_xvd = match XvdFile::parse(&mut remote_file).await {
+        Ok(xvd) => xvd,
+        Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+    };
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
-    let files = remote_xvd
+    let files = match remote_xvd
         .parse_user_package_files(&mut remote_file)
         .await
-        .expect("ok");
+    {
+        Ok(files) => files,
+        Err(error) => {
+            failure::report_metadata(error.as_ref());
+            return ExitCode::FAILURE;
+        }
+    };
     for (k, v) in &files {
         if k == "SegmentMetadata.bin" {
-            let sfiles = remote_xvd
+            let sfiles = match remote_xvd
                 .parse_segment_metadata(&mut remote_file, v)
-                .await
-                .expect("ok");
+                .await {
+                Ok(files) => files,
+                Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+            };
             rfiles = sfiles;
         }
     }
@@ -274,10 +377,12 @@ where
         })
         .await
         .ok();
-        let sfiles = remote_xvd
+        let sfiles = match remote_xvd
             .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
-            .await
-            .expect("ok");
+            .await {
+            Ok(files) => files,
+            Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+        };
         rfiles.extend(sfiles);
     }
 
@@ -288,12 +393,24 @@ where
         .ok();
 
     if let Some(mut file) = file {
-        let xvd = XvdFile::parse(&mut file).await.expect("no err");
+        let xvd = match XvdFile::parse(&mut file).await {
+            Ok(xvd) => xvd,
+            Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+        };
 
-        let files = xvd.parse_user_package_files(&mut file).await.expect("ok");
+        let files = match xvd.parse_user_package_files(&mut file).await {
+            Ok(files) => files,
+            Err(error) => {
+                failure::report_metadata(error.as_ref());
+                return ExitCode::FAILURE;
+            }
+        };
         for (k, v) in &files {
             if k == "SegmentMetadata.bin" {
-                let sfiles = xvd.parse_segment_metadata(&mut file, v).await.expect("ok");
+                let sfiles = match xvd.parse_segment_metadata(&mut file, v).await {
+                    Ok(files) => files,
+                    Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+                };
                 lfiles = sfiles;
             }
         }
@@ -311,11 +428,14 @@ where
         tokens,
         remote_xvd.content_id().to_string(),
         market.unwrap_or("neutral".to_string()),
+        // Downloads stay online-only; offline licenses are for launching installed games.
+        None,
+        false,
     )
     .await;
     if let Err(err) = license {
         eprintln!("{}", err);
-        return;
+        return ExitCode::FAILURE;
     }
     let (key, game_splicense) = license.unwrap();
     if game_splicense.content_keys.len() != 1 {
@@ -323,27 +443,62 @@ where
             "unexpected number of content keys {}",
             game_splicense.content_keys.len()
         );
-        return;
+        return ExitCode::FAILURE;
     }
     let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
-        return;
+        return ExitCode::FAILURE;
     };
 
-    let full_key = content_key.unpack(&key).expect("failed to unpack");
+    let full_key = match content_key.unpack(&key) {
+        Ok(key) => key,
+        Err(_) => { eprintln!("The content key could not be authenticated. Retry the installation or sign in again."); return ExitCode::FAILURE; }
+    };
 
-    let total_size = rfiles
-        .iter()
-        .filter(|(k, v1)| {
-            if let Some(v2) = lfiles.get(*k) {
-                v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
-            } else {
-                true
-            }
-        })
-        .map(|(_, v)| v.length)
-        .sum();
-
-    let required_free_space = total_size;
+    let recovering = match crate::installation_state::incomplete(out) {
+        Ok(value) => value,
+        Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+    };
+    let mut pending = match update::pending(out, &rfiles, &lfiles, recovering) {
+        Ok(files) => files,
+        Err(error) => { eprintln!("Unable to inspect installed package files: {error}"); return ExitCode::FAILURE; }
+    };
+    let identity = match resume::Journal::identity(&remote_xvd.resume_identity(), &rfiles) {
+        Ok(identity) => identity,
+        Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+    };
+    let installed_journal = match resume::Journal::open_with_identity(out, &identity) {
+        Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
+        Err(error) => { eprintln!("Unable to prepare download checkpoints: {error}"); return ExitCode::FAILURE; }
+    };
+    let stage = if !final_path.exists() && !recovering { None } else {
+        match update::staging(out) {
+            Ok(stage) => Some(stage),
+            Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+        }
+    };
+    if stage.is_some() {
+        pending.retain(|(name,file)| !update::completed(&installed_journal.lock().unwrap(),out,name,file));
+    }
+    let journal = match &stage {
+        Some(stage) => match resume::Journal::open_with_identity(stage, &identity) {
+            Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
+            Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+        },
+        None => installed_journal.clone(),
+    };
+    let total_size: u64 = pending.iter().map(|(_,file)|file.length).sum();
+    let saved: u64 = pending.iter().map(|(name,file)| journal.lock().unwrap().offset(name,file.length)).sum();
+    let required_free_space = match &stage {
+        Some(_) => match update::required_space(out,pending.iter().copied(),&journal.lock().unwrap()) {
+            Ok(size) => size,
+            Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+        },
+        None => total_size.saturating_sub(saved),
+    };
+    if stage.is_some() {
+        eprintln!("Update plan: {} bytes in changed files; {} bytes of extra disk space. Files are staged one at a time; verified local pages are reused, only gaps are downloaded.",total_size,required_free_space);
+        tx.send(ProgressEvent::Traffic {network:0,reused:0}).await.ok();
+    }
     let available_free_space = match available_space(out) {
         Ok(space) => space,
         Err(err) => {
@@ -352,7 +507,7 @@ where
                 out.display(),
                 err
             );
-            return;
+            return ExitCode::FAILURE;
         }
     };
 
@@ -364,9 +519,14 @@ where
             available_free_space,
             total_size
         );
-        return;
+        return ExitCode::FAILURE;
     }
 
+    if stage.is_some() {
+        if let Err(error) = update::begin(out, &rfiles, &pending) {
+            failure::report(&error); return ExitCode::FAILURE;
+        }
+    }
     tx.send(ProgressEvent::UpdateRemaining {
         name: "Downloading".to_owned(),
         total: total_size,
@@ -375,16 +535,10 @@ where
     .ok();
 
     let remote_xvd_ref = &remote_xvd;
+    let (failed, failure_signal) = tokio::sync::watch::channel(false);
     stream::iter(
-        rfiles
-            .iter()
-            .filter(|(k, v1)| {
-                if let Some(v2) = lfiles.get(*k) {
-                    v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
-                } else {
-                    true
-                }
-            })
+        pending
+            .into_iter()
             .map(|(n, v)| Job {
                 name: n.clone(),
                 content: SegmentFile {
@@ -396,22 +550,43 @@ where
             })
             .enumerate(),
     )
-    .for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
+    .for_each_concurrent(if stage.is_some() { 1 } else { parallel.unwrap_or(4).max(1) }, |(id, job)| {
         let tx = tx.clone();
         let client = client.clone();
+        let mut pause = pause.clone();
+        let journal = journal.clone();
+        let installed_journal = installed_journal.clone();
+        let stage = stage.as_deref();
+        let old = lfiles.get(&job.name);
+        let full_content = &rfiles[&job.name];
+        let failed = failed.clone();
+        let failure_signal = failure_signal.clone();
         async move {
-            let target_file = out.join(job.name.replace("\\", "/"));
-            if let Some(folder) = target_file.parent() {
-                std::fs::create_dir_all(folder).expect("ok");
+            if *failed.borrow() { return; }
+            let prepared = async {
+                pause.wait_for(|paused| !*paused).await.ok();
+                Ok(())
+            };
+            if failure::run_or_cancel(failure_signal.clone(), prepared).await.is_err() { return; }
+            let opened = async {
+                let target_file = match stage { Some(stage)=>update::output(stage,&job.name)?, None=>resume::target(out,&job.name)? };
+                if let Some(folder) = target_file.parent() { std::fs::create_dir_all(folder)?; }
+                Ok::<_,failure::Error>(OpenOptions::new().create(true).write(true).truncate(false).open(&target_file).await?)
+            }.await;
+            let mut fout = match opened {
+                Ok(file) => file,
+                Err(error) => { if !failed.send_replace(true) { failure::report(error.as_ref()); } return; }
+            };
+            let operation = async {
+            let mut offset = journal
+                .lock()
+                .unwrap()
+                .offset(&job.name, job.content.length);
+            if url.starts_with("file://") && offset != job.content.length {
+                offset = 0;
             }
-            let mut fout = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(target_file)
-                .await
-                .expect("ok");
-            let mut lp = 0;
+            offset = resume::prepare_output(&mut fout, offset, &job.content).await?;
+            let mut lp = offset;
 
             let progress = |pos, _| {
                 if tx
@@ -425,8 +600,9 @@ where
                 }
             };
             let path = job.name.to_owned();
-            let shown = if path.len() > 30 {
-                format!("...{}", &path[path.len() - 27..])
+            let shown = if path.chars().count() > 30 {
+                let tail: String = path.chars().rev().take(27).collect::<Vec<_>>().into_iter().rev().collect();
+                format!("...{tail}")
             } else {
                 path.clone()
             };
@@ -438,24 +614,69 @@ where
             .await
             .ok();
 
-            if let Some(fpath) = url.strip_prefix("file://") {
-                let mut i = File::open(&fpath).await.unwrap();
+            tx.send(ProgressEvent::Advanced { id, delta: offset })
+                .await
+                .ok();
+            if offset == job.content.length {
+                return Ok::<(),failure::Error>(());
+            }
+            journal
+                .lock()
+                .unwrap()
+                .checkpoint(&job.name, offset)?;
+
+            if stage.is_some() && !url.starts_with("file://") {
+                update::transfer(remote_xvd_ref,&client,url,&resume::target(out,&job.name)?,old,
+                    full_content,&mut fout,*full_key,offset,pause.clone(),parallel.unwrap_or(4),&tx,id,
+                    |synced|journal.lock().unwrap().checkpoint_synced(&job.name,synced)).await?;
+            } else if let Some(fpath) = url.strip_prefix("file://") {
+                let mut i = File::open(&fpath).await?;
                 remote_xvd_ref
                     .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
-                    .await
-                    .expect("msg");
-                tx.send(ProgressEvent::Finished { id }).await.ok();
+                    .await?;
             } else {
                 remote_xvd_ref
-                    .download_file_http(&client, url, &mut fout, &job.content, *full_key, progress)
-                    .await
-                    .expect("msg");
-                tx.send(ProgressEvent::Finished { id }).await.ok();
+                    .download_file_http(
+                        &client,
+                        url,
+                        &mut fout,
+                        &job.content,
+                        *full_key,
+                        progress,
+                        Some(pause),
+                        offset,
+                        |position| journal.lock().unwrap().checkpoint(&job.name, position),
+                    )
+                    .await?;
+            }
+            Ok(())
+            };
+            let result = failure::run_or_cancel(failure_signal, operation).await;
+            let result = failure::settle(&mut fout, result, || journal.lock().unwrap().checkpoint(&job.name,job.content.length)).await;
+            let result = result.and_then(|()| {
+                if let Some(stage) = stage {
+                    update::commit(stage,out,&job.name)?;
+                    installed_journal.lock().unwrap().checkpoint(&job.name,job.content.length)?;
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => { tx.send(ProgressEvent::Finished { id }).await.ok(); }
+                Err(error) => { if !failed.send_replace(true) { failure::report(error.as_ref()); } }
             }
         }
     })
     .await;
 
-    std::fs::remove_file(&final_path).ok();
-    std::fs::rename(&cache_path, &final_path).expect("ok");
+    if *failed.borrow() { return ExitCode::FAILURE; }
+    tx.send(ProgressEvent::UpdateStatus {
+        name: "Finalizing".to_owned(),
+    })
+    .await
+    .ok();
+    if let Err(error) = crate::installation_state::finish(out, &cache_path, &final_path) {
+        failure::report(&error);
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }

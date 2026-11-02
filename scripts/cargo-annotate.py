@@ -62,7 +62,7 @@ def main() -> int:
         if gh_level is None:
             continue
 
-        if gh_level == "error":
+        if level == "error":
             saw_error = True
 
         span = primary_span(message.get("spans", []))
