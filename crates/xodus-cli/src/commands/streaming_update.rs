@@ -1,0 +1,437 @@
+//! Bounded, atomic per-file updates with authenticated reuse of relocated pages.
+use super::{ProgressEvent, failure, resume};
+use msixvc::{
+    layout::PAGE_SIZE,
+    xvd::{SegmentFile, XvdFile},
+};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{self, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{mpsc::Sender, watch},
+};
+
+pub(super) fn staging(root: &Path) -> io::Result<PathBuf> {
+    let path = resume::target(root, ".nexus-update-v1")?;
+    match fs::create_dir(&path) {
+        Ok(()) => (),
+        Err(e)
+            if e.kind() == io::ErrorKind::AlreadyExists
+                && fs::symlink_metadata(&path)?.is_dir() =>
+        {
+            ()
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(path)
+}
+
+/// Existing output is reclaimed only after its staged replacement is complete.
+/// Count growth conservatively regardless of download order; never credit hardlinks.
+pub(super) fn required_space<'a>(
+    root: &Path,
+    pending: impl Iterator<Item = (&'a String, &'a SegmentFile)>,
+    staged: &resume::Journal,
+) -> io::Result<u64> {
+    let mut growth = 0u64;
+    let mut peak = 0u64;
+    for (name, file) in pending {
+        let target = resume::target(root, name)?;
+        let old = match fs::metadata(target) {
+            Ok(m) if m.is_file() => {
+                use std::os::unix::fs::MetadataExt;
+                if m.nlink() == 1 {
+                    m.blocks().saturating_mul(512)
+                } else {
+                    0
+                }
+            }
+            Ok(_) => return Err(io::Error::other("package target is not a regular file")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        let size = file.stored_length()?;
+        growth = growth.saturating_add(size.saturating_sub(old));
+        peak = peak.max(size.saturating_sub(staged.offset(name, file.length)));
+    }
+    Ok(growth.saturating_add(peak).saturating_add(64 * 1024 * 1024))
+}
+
+pub(super) fn output(stage: &Path, name: &str) -> io::Result<PathBuf> {
+    let path = resume::target(stage, name)?;
+    match fs::symlink_metadata(&path) {
+        Ok(m) => {
+            use std::os::unix::fs::MetadataExt;
+            if !m.is_file() || m.nlink() != 1 {
+                return Err(io::Error::other("unsafe staged output"));
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    Ok(path)
+}
+
+pub(super) fn commit(stage: &Path, root: &Path, name: &str) -> io::Result<()> {
+    let from = output(stage, name)?;
+    let to = resume::target(root, name)?;
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !fs::symlink_metadata(&from)?.is_file() {
+        return Err(io::Error::other("staged output is not a regular file"));
+    }
+    fs::File::open(&from)?.sync_all()?;
+    fs::rename(&from, &to)?;
+    fs::File::open(to.parent().unwrap())?.sync_all()?;
+    fs::File::open(from.parent().unwrap())?.sync_all()
+}
+
+pub(super) fn completed(
+    journal: &resume::Journal,
+    root: &Path,
+    name: &str,
+    file: &SegmentFile,
+) -> bool {
+    // Zero is also the sentinel for a missing checkpoint; empty files need a real file.
+    journal.offset(name, file.length) == file.length
+        && resume::target(root, name)
+            .and_then(fs::metadata)
+            .is_ok_and(|m| m.is_file() && m.len() >= file.stored_length().unwrap_or(u64::MAX))
+}
+
+pub(super) async fn transfer(
+    xvd: &XvdFile,
+    client: &reqwest::Client,
+    url: &str,
+    installed: &Path,
+    old: Option<&SegmentFile>,
+    file: &SegmentFile,
+    out: &mut tokio::fs::File,
+    key: [u8; 32],
+    mut offset: u64,
+    mut pause: watch::Receiver<bool>,
+    tx: &Sender<ProgressEvent>,
+    id: usize,
+    mut checkpoint: impl FnMut(u64) -> io::Result<()>,
+) -> Result<(), failure::Error> {
+    let mut source = None;
+    let mut index = HashMap::new();
+    if let Some(old) = old.filter(|old| old.keep_encrypted == file.keep_encrypted) {
+        if let Ok(input) = fs::File::open(installed) {
+            if input.metadata()?.is_file() {
+                for (page, hash) in old.data_hashs.iter().enumerate() {
+                    index.entry(*hash).or_insert(page as u64);
+                }
+                source = Some(std::io::BufReader::with_capacity(1024 * 1024, input));
+            }
+        }
+    }
+    let verifier = xvd.stored_page_verifier(file, key);
+    let mut read_position = u64::MAX;
+    let mut last_checkpoint = offset;
+    const WINDOW: usize = 8 * 1024 * 1024;
+    const MERGE_PAGES: usize = 16;
+    while offset < file.length {
+        pause.wait_for(|paused| !*paused).await.ok();
+        let start = offset;
+        let bytes = (file.stored_length()? - start).min(WINDOW as u64) as usize;
+        let pages = bytes.div_ceil(PAGE_SIZE);
+        let mut data = vec![0u8; pages * PAGE_SIZE];
+        let mut reused = vec![false; pages];
+        tokio::task::block_in_place(|| {
+            if let Some(input) = source.as_mut() {
+                for (n, page) in data.chunks_exact_mut(PAGE_SIZE).enumerate() {
+                    let position = (start / PAGE_SIZE as u64) as usize + n;
+                    let Some(candidate) = file
+                        .data_hashs
+                        .get(position)
+                        .and_then(|hash| index.get(hash))
+                    else {
+                        continue;
+                    };
+                    let wanted = candidate * PAGE_SIZE as u64;
+                    let read = (|| -> io::Result<()> {
+                        if read_position != wanted {
+                            input.seek(SeekFrom::Start(wanted))?;
+                        }
+                        input.read_exact(page)?;
+                        read_position = wanted + PAGE_SIZE as u64;
+                        Ok(())
+                    })();
+                    if read.is_err() {
+                        read_position = u64::MAX;
+                        continue;
+                    }
+                    reused[n] = verifier.matches(position, (&*page).try_into().unwrap());
+                }
+            }
+        });
+        let mut n = 0;
+        while n < pages {
+            let local = reused[n];
+            let begin = n;
+            n += 1;
+            while n < pages && reused[n] == local {
+                n += 1;
+            }
+            if !local {
+                // Coalesce tiny reusable islands rather than issue thousands of 4K requests.
+                loop {
+                    let mut end = n;
+                    while end < pages && reused[end] {
+                        end += 1;
+                    }
+                    if end == pages || end - n > MERGE_PAGES {
+                        break;
+                    }
+                    n = end;
+                    while n < pages && !reused[n] {
+                        n += 1;
+                    }
+                }
+            }
+            let base = start + (begin * PAGE_SIZE) as u64;
+            let length = ((n - begin) * PAGE_SIZE) as u64;
+            let logical = length.min(file.length - base);
+            if local {
+                let physical = if file.keep_encrypted { length } else { logical } as usize;
+                out.write_all(&data[begin * PAGE_SIZE..begin * PAGE_SIZE + physical])
+                    .await?;
+                tx.send(ProgressEvent::Traffic {
+                    network: 0,
+                    reused: logical,
+                })
+                .await
+                .ok();
+            } else {
+                let segment = SegmentFile {
+                    offset: file.offset + base,
+                    length: logical,
+                    keep_encrypted: file.keep_encrypted,
+                    data_hashs: vec![],
+                };
+                xvd.download_file_http(
+                    client,
+                    url,
+                    out,
+                    &segment,
+                    key,
+                    |_, _| {},
+                    Some(pause.clone()),
+                    0,
+                    |n| checkpoint(base + n),
+                )
+                .await?;
+                tx.send(ProgressEvent::Traffic {
+                    network: logical,
+                    reused: 0,
+                })
+                .await
+                .ok();
+            }
+            tx.send(ProgressEvent::Advanced { id, delta: logical })
+                .await
+                .ok();
+            offset = base + logical;
+            if offset - last_checkpoint >= 32 * 1024 * 1024 {
+                out.flush().await?;
+                checkpoint(offset)?;
+                last_checkpoint = offset;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn streaming_update_stages_and_commits_without_touching_old_file_until_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("game.bin"), b"old valid file").unwrap();
+        let stage = staging(root).unwrap();
+        fs::write(stage.join("game.bin"), b"new valid file").unwrap();
+        assert_eq!(fs::read(root.join("game.bin")).unwrap(), b"old valid file");
+        commit(&stage, root, "game.bin").unwrap();
+        assert_eq!(fs::read(root.join("game.bin")).unwrap(), b"new valid file");
+        assert!(!stage.join("game.bin").exists());
+        assert!(commit(&stage, root, "../outside").is_err());
+    }
+    #[test]
+    fn streaming_update_rejects_symlinked_stage_and_commit_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(other.path(), dir.path().join(".nexus-update-v1")).unwrap();
+        assert!(staging(dir.path()).is_err());
+        fs::remove_file(dir.path().join(".nexus-update-v1")).unwrap();
+        let stage = staging(dir.path()).unwrap();
+        fs::write(stage.join("game.bin"), b"new").unwrap();
+        std::os::unix::fs::symlink(other.path().join("save.bin"), dir.path().join("game.bin"))
+            .unwrap();
+        assert!(commit(&stage, dir.path(), "game.bin").is_err());
+        assert!(stage.join("game.bin").exists());
+    }
+    #[test]
+    fn streaming_update_space_uses_largest_staged_file_not_sum_of_replacements() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let stage = staging(root).unwrap();
+        let files = HashMap::from([
+            (
+                "a".into(),
+                SegmentFile {
+                    offset: 0,
+                    length: 8192,
+                    keep_encrypted: false,
+                    data_hashs: vec![],
+                },
+            ),
+            (
+                "b".into(),
+                SegmentFile {
+                    offset: 0,
+                    length: 8192,
+                    keep_encrypted: false,
+                    data_hashs: vec![],
+                },
+            ),
+        ]);
+        for name in files.keys() {
+            fs::write(root.join(name), vec![1; 8192]).unwrap();
+        }
+        let journal = resume::Journal::open(&stage, "test", &files).unwrap();
+        assert_eq!(
+            required_space(root, files.iter(), &journal).unwrap(),
+            8192 + 64 * 1024 * 1024
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_update_reuses_relocated_pages_and_downloads_modified_or_corrupt_pages_only()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (corrupt, initial) in [(false, 0usize), (true, 0), (false, PAGE_SIZE)] {
+            let dir = tempfile::tempdir().unwrap();
+            let original = [
+                vec![1u8; PAGE_SIZE],
+                vec![2u8; PAGE_SIZE],
+                vec![3u8; PAGE_SIZE],
+            ]
+            .concat();
+            let remote = [
+                vec![2u8; PAGE_SIZE],
+                vec![7u8; PAGE_SIZE],
+                vec![1u8; PAGE_SIZE],
+            ]
+            .concat();
+            let hash = |page: &[u8]| {
+                let h = msixvc::streaming::resume_digest(page);
+                std::array::from_fn(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap())
+            };
+            let old = SegmentFile {
+                offset: 0,
+                length: original.len() as u64,
+                keep_encrypted: false,
+                data_hashs: original.chunks_exact(PAGE_SIZE).map(hash).collect(),
+            };
+            let file = SegmentFile {
+                offset: 0,
+                length: remote.len() as u64,
+                keep_encrypted: false,
+                data_hashs: remote.chunks_exact(PAGE_SIZE).map(hash).collect(),
+            };
+            let mut local = original.clone();
+            if corrupt {
+                local[PAGE_SIZE + 100] ^= 1;
+            }
+            let installed = dir.path().join("old.bin");
+            fs::write(&installed, &local).unwrap();
+            // Minimal unencrypted XVD header, no services, keys or game data.
+            let mut header = vec![0u8; 0x3000];
+            header[512..520].copy_from_slice(b"msft-xvd");
+            header[528..536].copy_from_slice(&116444736000000000u64.to_le_bytes());
+            header[652..656].copy_from_slice(&4u32.to_le_bytes());
+            let xvd = XvdFile::parse(&mut std::io::Cursor::new(header))
+                .await
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected_start = if corrupt { 0 } else { PAGE_SIZE };
+            let expected_end = PAGE_SIZE * 2 - 1;
+            let body = remote.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![];
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                    assert!(request.len() < 8192);
+                }
+                assert!(
+                    String::from_utf8(request)
+                        .unwrap()
+                        .to_lowercase()
+                        .contains(&format!("range: bytes={expected_start}-{expected_end}\r\n"))
+                );
+                socket.write_all(format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {expected_start}-{expected_end}/{}\r\nConnection: close\r\n\r\n",expected_end-expected_start+1,body.len()).as_bytes()).await.unwrap();
+                socket
+                    .write_all(&body[expected_start..=expected_end])
+                    .await
+                    .unwrap();
+            });
+            let output = dir.path().join("new.bin");
+            let mut out = tokio::fs::File::create(&output).await.unwrap();
+            out.write_all(&remote[..initial]).await.unwrap();
+            let (_control, pause) = watch::channel(false);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let mut positions = vec![];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                transfer(
+                    &xvd,
+                    &reqwest::Client::new(),
+                    &format!("http://{address}/fixture"),
+                    &installed,
+                    Some(&old),
+                    &file,
+                    &mut out,
+                    [0; 32],
+                    initial as u64,
+                    pause,
+                    &tx,
+                    0,
+                    |n| {
+                        positions.push(n);
+                        Ok(())
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            out.flush().await.unwrap();
+            server.await.unwrap();
+            assert_eq!(fs::read(&output).unwrap(), remote);
+            assert_eq!(fs::read(&installed).unwrap(), local);
+            let (mut network, mut reused) = (0, 0);
+            drop(tx);
+            while let Some(event) = rx.recv().await {
+                if let ProgressEvent::Traffic {
+                    network: n,
+                    reused: r,
+                } = event
+                {
+                    network += n;
+                    reused += r;
+                }
+            }
+            assert_eq!(network, (expected_end - expected_start + 1) as u64);
+            assert_eq!(network + reused, (remote.len() - initial) as u64);
+        }
+    }
+}

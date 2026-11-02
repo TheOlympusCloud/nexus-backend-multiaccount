@@ -304,6 +304,33 @@ pub struct EncryptedSectionInfo {
     data_hashs: Vec<[u8; 20]>,
 }
 
+/// Verifies installed plaintext by reconstructing the licensed package ciphertext.
+/// Metadata hashes identify candidates; only a matching reconstructed hash permits reuse.
+pub struct StoredPageVerifier<'a> {
+    file: &'a SegmentFile,
+    section: Option<&'a EncryptedSectionInfo>,
+    ciphers: Option<(Aes128Enc, Aes128Enc)>,
+}
+impl StoredPageVerifier<'_> {
+    pub fn matches(&self, index: usize, bytes: &[u8; PAGE_SIZE]) -> bool {
+        use sha2::{Digest, Sha256};
+        let Some(expected) = self.file.data_hashs.get(index) else { return false; };
+        let mut ciphertext = *bytes;
+        if let Some((tweak_cipher, data_cipher)) = &self.ciphers {
+            let Some(section) = self.section else { return false; };
+            let page = (self.file.offset - section.section_offset) / PAGE_SIZE as u64 + index as u64;
+            let unit = match &section.data_units {
+                Some(units) => match units.get(page as usize) { Some(unit) => *unit, None => return false },
+                None => match u32::try_from(page) { Ok(unit) => unit, Err(_) => return false },
+            };
+            crate::crypt::encrypt_page_xts(&mut ciphertext,
+                TweakGenerator::new(section.header_id, section.vduid).with_data_unit(unit),
+                tweak_cipher, data_cipher);
+        }
+        Sha256::digest(ciphertext)[..20] == expected[..]
+    }
+}
+
 pub struct UserPackageFile {
     pub offset: u64,
     pub length: u64,
@@ -330,6 +357,17 @@ impl SegmentFile {
 }
 
 impl XvdFile {
+    pub fn stored_page_verifier<'a>(&'a self, file: &'a SegmentFile, key: [u8; 32]) -> StoredPageVerifier<'a> {
+        let section = self.encrypted_section_infos.iter().find(|section|
+            file.offset >= section.section_offset && file.offset < section.section_offset + section.section_length);
+        let ciphers = if !file.keep_encrypted && section.is_some() {
+            let tweak_key: [u8; 16] = key[..16].try_into().unwrap();
+            let data_key: [u8; 16] = key[16..].try_into().unwrap();
+            Some((Aes128Enc::new((&tweak_key).into()), Aes128Enc::new((&data_key).into())))
+        } else { None };
+        StoredPageVerifier { file, section, ciphers }
+    }
+
     pub fn content_id(&self) -> uuid::Uuid {
         self.header.vduid
     }

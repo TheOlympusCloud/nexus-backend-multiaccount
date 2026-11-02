@@ -107,3 +107,19 @@ async fn streaming_plain_output_remains_unpadded_and_short_ciphertext_returns_er
     assert_eq!(downloaded.len(),5000);
     assert_eq!(downloaded,plain);
 }
+
+#[test]
+fn streaming_update_verifier_checks_licensed_plaintext_ciphertext_wrong_keys_and_modified_pages() {
+    use sha2::{Digest,Sha256};
+    let (xvd,mut content,key,plain,ciphertext)=fixture(8192);
+    content.data_hashs=ciphertext.chunks_exact(PAGE_SIZE).map(|p|Sha256::digest(p)[..20].try_into().unwrap()).collect();
+    assert!(xvd.stored_page_verifier(&content,key).matches(0,ciphertext[..PAGE_SIZE].try_into().unwrap()));
+    content.keep_encrypted=false;
+    let page: &[u8;PAGE_SIZE]=plain[..PAGE_SIZE].try_into().unwrap();
+    assert!(xvd.stored_page_verifier(&content,key).matches(0,page));
+    assert!(!xvd.stored_page_verifier(&content,[0;32]).matches(0,page));
+    let mut corrupt=*page;corrupt[200]^=1;
+    assert!(!xvd.stored_page_verifier(&content,key).matches(0,&corrupt));
+    assert!(!xvd.stored_page_verifier(&content,key).matches(1,page));
+    assert!(!xvd.stored_page_verifier(&content,key).matches(2,page));
+}
