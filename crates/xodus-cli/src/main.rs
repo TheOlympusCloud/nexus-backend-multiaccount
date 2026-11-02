@@ -8,6 +8,7 @@ use xodus::tokens::TokenManager;
 
 mod commands;
 mod license;
+mod license_cache;
 mod installation_state;
 mod package;
 mod package_plan;
@@ -172,6 +173,8 @@ enum SubCommand {
         materialize_chain: bool,
         #[arg(short, long)]
         market: Option<String>,
+        #[arg(long = "license-cache", help = "Directory for device-bound offline licenses (--license-cache) used when Microsoft is unreachable")]
+        license_cache: Option<String>,
     },
     #[command(about = "Generate or decrypt base64-encoded CLEP challenge data")]
     Clep {
@@ -181,6 +184,13 @@ enum SubCommand {
     #[command(about = "Decode SPLicenseBlock")]
     SpLicense {
         block: String,
+    },
+    #[command(about = "Show or change whether this device is the account's designated offline PC (JSON on stdout)")]
+    OfflinePc {
+        #[arg(long, help = "Designate (true) or undesignate (false) this device; requires --confirm")]
+        set: Option<bool>,
+        #[arg(long, default_value_t = false, help = "Acknowledge that Microsoft limits changes and allows one offline PC per account")]
+        confirm: bool,
     },
 }
 
@@ -431,6 +441,7 @@ async fn main() -> ExitCode {
             materialize_exe,
             materialize_chain,
             market,
+            license_cache,
         } => {
             commands::run::run(
                 &client,
@@ -441,6 +452,7 @@ async fn main() -> ExitCode {
                 materialize_exe,
                 materialize_chain,
                 market,
+                license_cache,
             )
             .await
         }
@@ -452,6 +464,9 @@ async fn main() -> ExitCode {
             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
         },
         SubCommand::SpLicense { block } => commands::splicense::run(block),
+        SubCommand::OfflinePc { set, confirm } => {
+            commands::offline_pc::run(&client, &tokens, set, confirm).await
+        }
     };
 
     xodus::secrets::destroy_secrets();

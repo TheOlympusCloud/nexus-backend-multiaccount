@@ -708,6 +708,7 @@ pub async fn run(
     materialize_exe: bool,
     materialize_chain: bool,
     market: Option<String>,
+    license_cache: Option<String>,
 ) -> ExitCode {
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
@@ -755,11 +756,13 @@ pub async fn run(
         merge_plain_launch_files(&mut lfiles, plain);
     }
 
+    let license_cache = license_cache.map(PathBuf::from);
     let license = get_license(
         client,
         tokens,
         xvd.content_id().to_string(),
         market.unwrap_or("neutral".to_string()),
+        license_cache.as_deref(),
     )
     .await;
     if let Err(err) = license {

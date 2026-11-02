@@ -428,6 +428,8 @@ where
         tokens,
         remote_xvd.content_id().to_string(),
         market.unwrap_or("neutral".to_string()),
+        // Downloads stay online-only; offline licenses are for launching installed games.
+        None,
     )
     .await;
     if let Err(err) = license {
