@@ -144,3 +144,35 @@ fn streaming_update_verifier_checks_licensed_plaintext_ciphertext_wrong_keys_and
     assert!(!xvd.stored_page_verifier(&content,key).matches(1,page));
     assert!(!xvd.stored_page_verifier(&content,key).matches(2,page));
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "synthetic encrypted loopback/disk benchmark, not Internet bandwidth"]
+async fn streaming_encrypted_loopback_file_benchmark() {
+    let (xvd, mut file, key, plain, ciphertext) = fixture(64 * 1024 * 1024 + 107);
+    file.keep_encrypted = false;
+    let length = file.length;
+    let stored = ciphertext.len();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") { request.push(socket.read_u8().await.unwrap()); }
+        socket.write_all(format!("HTTP/1.1 206 Test\r\nContent-Length: {stored}\r\nContent-Range: bytes 0-{}/{stored}\r\nConnection: close\r\n\r\n",stored-1).as_bytes()).await.unwrap();
+        socket.write_all(&ciphertext).await.unwrap();
+    });
+    let target = std::env::temp_dir().join(format!("nexus-encrypted-throughput-{}.bin", Uuid::new_v4()));
+    let mut output = tokio::fs::OpenOptions::new().create_new(true).write(true).open(&target).await.unwrap();
+    let client = reqwest::Client::new();
+    let start = std::time::Instant::now();
+    xvd.download_file_http(&client, &format!("http://{address}/fixture"), &mut output, &file, key,
+        |_,_|{}, None, 0, |_|Ok(())).await.unwrap();
+    output.sync_all().await.unwrap();
+    let seconds = start.elapsed().as_secs_f64();
+    server.await.unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), plain);
+    drop(output);
+    std::fs::remove_file(target).unwrap();
+    eprintln!("XTS_HTTP_BENCH bytes={length} seconds={seconds:.6} MiBps={:.2}", length as f64 / 1048576.0 / seconds);
+}
