@@ -42,6 +42,8 @@ pub enum TokenStoreError {
     WriteVerification,
     #[error("Device authentication did not complete. Check the network connection and try again.")]
     DeviceAuthentication,
+    #[error("The signed-in session changed while authenticating. Try again.")]
+    SessionChanged,
 }
 
 impl TokenStoreError {
@@ -54,6 +56,7 @@ impl TokenStoreError {
             Self::NotFound => "keyring-missing-data",
             Self::WriteVerification => "keyring-write-verification",
             Self::DeviceAuthentication => "device-authentication",
+            Self::SessionChanged => "session-changed",
         }
     }
     pub fn report(&self) {

@@ -94,6 +94,14 @@ mod tests {
             let _guard = lock_at(&root.join("lock"), Duration::from_secs(5)).unwrap();
             println!("LOCK_READY");
             std::thread::sleep(Duration::from_secs(20));
+        } else if mode == "logout" || mode == "relogin" || mode == "switch" {
+            let manager = manager(&root);
+            manager.remove_persistent().unwrap();
+            if mode != "logout" {
+                let name = if mode == "relogin" { "a" } else { "b" };
+                manager.save_user_session(crate::models::secrets::User { puid: name.into(), username: name.into() },
+                    std::collections::HashMap::from([(crate::tokens::PASSPORT_STS.into(), Token::Compact(name.into()))])).unwrap();
+            }
         } else {
             let manager = manager(&root);
             for i in 0..20 { manager.save_device_token(format!("{mode}-{i}"), Token::Compact("synthetic".into())).unwrap(); }
@@ -144,4 +152,17 @@ mod tests {
         assert!(lock_at(&directory, Duration::ZERO).is_err());
         assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
     }
+    #[test]
+    fn credential_stale_response_is_rejected_after_another_process_changes_session() {
+        for mode in ["logout", "switch", "relogin"] {
+            let root = Directory::new(); let manager = manager(&root.0);
+            manager.save_user_session(crate::models::secrets::User { puid: "a".into(), username: "a".into() },
+                std::collections::HashMap::from([(crate::tokens::PASSPORT_STS.into(), Token::Compact("a".into()))])).unwrap();
+            let mut snapshot = manager.user_token_snapshot().unwrap();
+            let mut other = child(&root.0, mode); assert!(other.0.wait().unwrap().success());
+            assert!(matches!(manager.accept_user_token_refresh(&mut snapshot,
+                Some((crate::tokens::PASSPORT_STS.into(), Token::Compact("stale".into())))), Err(TokenStoreError::SessionChanged)));
+        }
+    }
+
 }

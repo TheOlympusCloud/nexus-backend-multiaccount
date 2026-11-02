@@ -125,7 +125,8 @@ pub async fn do_sisu(
     ),
     Box<dyn std::error::Error>,
 > {
-    let Token::Legacy(token) = manager.get_user_sts_token()? else {
+    let mut snapshot = manager.user_token_snapshot()?;
+    let Token::Legacy(token) = snapshot.token() else {
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "error",
@@ -174,11 +175,7 @@ pub async fn do_sisu(
     .await?;
 
     let (user_token, refreshed) = sisu_user_tokens(user_token)?;
-    if let Some((address, sts)) = refreshed {
-        if let Err(err) = manager.save_user_token(address, sts) {
-            tracing::warn!("Failed to persist refreshed STS token: {err}");
-        }
-    }
+    manager.accept_user_token_refresh(&mut snapshot, refreshed)?;
 
     let mut auth = XalAuthenticator::new(
         XalAppParameters {
@@ -203,6 +200,7 @@ pub async fn do_sisu(
     let resp = auth
         .sisu_authorize_rps(&user_token, &data.token, None)
         .await?;
+    manager.validate_user_token_snapshot(&snapshot)?;
     Ok((auth, resp, data))
 }
 

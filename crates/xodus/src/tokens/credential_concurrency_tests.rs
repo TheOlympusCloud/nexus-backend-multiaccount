@@ -120,3 +120,15 @@ fn credential_failed_update_releases_transaction_for_retry() {
     assert!(matches!(manager.get_user_token_for("refresh").unwrap(), Some(Token::Compact(value)) if value == "new"));
     assert!(matches!(manager.get_user_sts_token().unwrap(), Token::Compact(value) if value == "account-a"));
 }
+
+#[test]
+fn credential_independent_managers_share_backend_transaction_guard() {
+    let (backend, manager) = setup();
+    session(&manager, "account-a");
+    let independent = TokenManager::new(backend.clone(), Arc::new(MemoryBackend::default()));
+    interleave(|m| m.save_user_token("first".into(), token("a")).unwrap(),
+        move |_| independent.save_user_token("second".into(), token("b")).unwrap(),
+        "user-session", &backend, &manager);
+    assert!(manager.get_user_token_for("first").unwrap().is_some());
+    assert!(manager.get_user_token_for("second").unwrap().is_some());
+}

@@ -54,11 +54,8 @@ pub async fn parse_message(
             let string_buf = std::str::from_utf8(&buffer)?;
             tracing::debug!("String buffer: {string_buf:?}");
             let req = quick_xml::de::from_str::<MSATokenRequest>(string_buf)?;
-            let identity_session = context.tokens().get_user_sts_session()?;
-            let request_token = match &identity_session {
-                Some((_, token)) => token.clone(),
-                None => context.tokens().get_user_sts_token()?,
-            };
+            let mut identity_session = context.tokens().user_token_snapshot()?;
+            let request_token = identity_session.token();
             let Token::Legacy(token) = request_token else {
                 return Ok(vec![]);
             };
@@ -110,13 +107,13 @@ pub async fn parse_message(
             )
             .await?;
 
-            let (user_token, expiry) = accept_user_tokens(context, user_token)?;
+            let (user_token, expiry) = accept_user_tokens(context, &mut identity_session, user_token)?;
             // Store licensing uses this same session facade. Bind the
             // Xbox ticket's MSA principal to its current Store account,
             // never infer either account identifier from an Xbox XUID.
             let current_identity = context.tokens().get_user_sts_session().ok().flatten();
             let (xbox_msa_account_id, store_msa_account_id) = crate::account_metadata::bound_ids(
-                identity_session.as_ref().map(|(user, _)| user),
+                identity_session.user(),
                 current_identity.as_ref().map(|(user, _)| user),
             );
             let payload = MSATokenResponse {
@@ -138,15 +135,12 @@ pub async fn parse_message(
 
 fn accept_user_tokens(
     context: &SimpleContext,
+    snapshot: &mut xodus::tokens::manager::UserTokenSnapshot,
     outcome: ExchangeUserTokenOutcome,
 ) -> Result<(String, i64), Box<dyn std::error::Error + Send + Sync>> {
     // Parse every token and its expiry before any credential-store mutation.
     let selected = xodus::auth::issued_user_tokens(outcome)?;
-    if let Some((address, token)) = selected.refreshed {
-        if let Err(error) = context.tokens().save_user_token(address, token) {
-            tracing::warn!("Failed to persist refreshed STS token: {error}");
-        }
-    }
+    context.tokens().accept_user_token_refresh(snapshot, selected.refreshed)?;
     Ok((selected.token, selected.expiry))
 }
 
@@ -156,6 +150,12 @@ mod token_response_tests {
     use serde_json::json;
     use std::sync::Arc;
     use xodus::tokens::{TokenManager, manager::PASSPORT_STS};
+
+    fn accept_user_tokens(context: &SimpleContext, outcome: ExchangeUserTokenOutcome)
+        -> Result<(String, i64), Box<dyn std::error::Error + Send + Sync>> {
+        let mut snapshot = context.tokens().user_token_snapshot()?;
+        super::accept_user_tokens(context, &mut snapshot, outcome)
+    }
 
     fn response(kind: &str, value: &str) -> soap::RequestSecurityTokenResponse {
         let mut result: soap::RequestSecurityTokenResponse = serde_json::from_value(json!({
@@ -288,4 +288,28 @@ mod token_response_tests {
             matches!(context.tokens().get_user_sts_token().unwrap(), Token::Compact(value) if value == "previous-synthetic-ticket")
         );
     }
+    #[test]
+    fn token_response_stale_session_never_returns_a_ticket_or_changes_credentials() {
+        for replace in [false, true] {
+            for with_refresh in [false, true] {
+                let context = context();
+                let session = |name: &str| context.tokens().save_user_session(
+                    xodus::models::secrets::User { puid: name.into(), username: name.into() },
+                    std::collections::HashMap::from([(PASSPORT_STS.into(), Token::Compact(name.into()))])).unwrap();
+                session("a");
+                let mut snapshot = context.tokens().user_token_snapshot().unwrap();
+                if replace { session("b"); } else { context.tokens().remove_persistent().unwrap(); }
+                let mut values = vec![response("urn:passport:compact", "old-account-ticket")];
+                if with_refresh { values.push(response("urn:passport:legacy", "")); }
+                let result = super::accept_user_tokens(&context, &mut snapshot, collection(values));
+                assert!(result.is_err(), "a stale account response was accepted");
+                match context.tokens().get_user_token_for(PASSPORT_STS).unwrap() {
+                    Some(Token::Compact(value)) if replace => assert_eq!(value, "b"),
+                    None if !replace => {},
+                    _ => panic!("old response changed the current credentials"),
+                }
+            }
+        }
+    }
+
 }

@@ -7,18 +7,25 @@ use crate::models::xbox::XstsResponse;
 use crate::tokens::backend::{KeychainBackend, MemoryBackend};
 use crate::tokens::store::{ExpiringTokenBackend, TokenBackend, TokenStoreError};
 
+#[path = "user_snapshot.rs"]
+mod user_snapshot;
+pub use user_snapshot::UserTokenSnapshot;
+
 mod keys {
     pub const DEV_LICENSE: &str = "dev_license";
     pub const DEVICE_TOKENS: &str = "device-tokens";
     pub const USER_TOKENS: &str = "user-tokens";
     pub const USER_INFO: &str = "user-DA";
     pub const USER_SESSION: &str = "user-session";
+    pub const USER_GENERATION: &str = "user-token-generation";
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UserSession {
     user: User,
     tokens: HashMap<String, Token>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<String>,
 }
 
 pub const PASSPORT_STS: &str = "http://Passport.NET/STS";
@@ -98,6 +105,7 @@ impl TokenManager {
 
     pub fn remove_persistent(&self) -> Result<(), TokenStoreError> {
         let _update = self.persistent_update()?;
+        self.invalidate_legacy_requests()?;
         self.persistent.remove(keys::DEVICE_TOKENS)?;
         self.persistent.remove(keys::USER_TOKENS)?;
         self.persistent.remove(keys::USER_INFO)?;
@@ -165,6 +173,7 @@ impl TokenManager {
                 &serde_json::to_vec(&session)?,
             );
         }
+        self.invalidate_legacy_requests()?;
         Self::write_token_store(&*self.persistent, keys::USER_TOKENS, address, token)
     }
 
@@ -196,6 +205,7 @@ impl TokenManager {
 
     pub fn save_user(&self, user: &User) -> Result<(), TokenStoreError> {
         let _update = self.persistent_update()?;
+        self.invalidate_legacy_requests()?;
         Self::write_verified(
             &*self.persistent,
             keys::USER_INFO,
@@ -222,7 +232,7 @@ impl TokenManager {
         if tokens.is_empty() || user.username.trim().is_empty() || user.puid.is_empty() {
             return Err(TokenStoreError::NotFound);
         }
-        let session = UserSession { user, tokens };
+        let session = UserSession { user, tokens, generation: Some(uuid::Uuid::new_v4().to_string()) };
         Self::write_verified(
             &*self.persistent,
             keys::USER_SESSION,
