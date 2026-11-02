@@ -16,3 +16,6 @@ pub mod library;
 pub mod run;
 pub mod splicense;
 pub mod streaming;
+
+pub mod native_social;
+pub mod native_social_party;

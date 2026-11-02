@@ -94,6 +94,11 @@ enum SubCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Extended native Nexus social services") ]
+    NativeSocial {
+        #[command(subcommand)]
+        action: commands::native_social::Action,
+    },
     #[command(about = "Explicit Xbox friends and text chat, JSON request on standard input")]
     Social {
         #[arg(long, required = true)]
@@ -295,6 +300,7 @@ async fn main() -> ExitCode {
         SubCommand::Account { .. }
             | SubCommand::Profile { .. }
             | SubCommand::Social { .. }
+            | SubCommand::NativeSocial { .. }
             | SubCommand::GameActivity { .. }
             | SubCommand::Achievements { .. }
             | SubCommand::Library { .. }
@@ -366,6 +372,7 @@ async fn main() -> ExitCode {
             }
         },
         SubCommand::Profile { json } => commands::profile::run(&tokens, json).await,
+        SubCommand::NativeSocial { action } => commands::native_social::run(&tokens,action).await,
         SubCommand::Social { .. } => commands::social::run(&tokens).await,
         SubCommand::GameActivity { title_id, json } => commands::game_activity::run(&tokens, title_id, json).await,
         SubCommand::Achievements { title_id, json } => commands::achievements::run(&tokens, title_id, json).await,
