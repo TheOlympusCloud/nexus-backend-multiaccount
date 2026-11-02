@@ -6,6 +6,149 @@ use std::sync::{
 };
 use tokio::io::AsyncReadExt;
 
+#[test]
+fn streaming_update_pipeline_builds_relocation_index_only_when_needed() {
+    let mut old=segment(4*PAGE_SIZE,true);
+    old.data_hashs=vec![[1;20],[2;20],[1;20],[4;20]];
+    let mut index=None;
+    assert_eq!(lazy_candidates(&old,&old,&mut index,0,4),vec![Some(0),Some(1),Some(2),Some(3)]);
+    assert!(index.is_none(),"same-position data must not index the whole archive");
+    let mut changed=segment(4*PAGE_SIZE,true);
+    changed.data_hashs=vec![[1;20],[1;20],[1;20],[9;20]];
+    assert_eq!(lazy_candidates(&old,&changed,&mut index,0,4),vec![Some(0),Some(0),Some(2),None]);
+    assert_eq!(index.as_ref().unwrap().len(),3);
+    assert_eq!(lazy_candidates(&old,&old,&mut index,0,4),vec![Some(0),Some(1),Some(2),Some(3)]);
+}
+
+#[tokio::test]
+async fn streaming_update_pipeline_overlaps_but_settles_current_write_before_lookahead_failure() {
+    let (started,start)=tokio::sync::oneshot::channel();
+    let (prepared,ready)=tokio::sync::oneshot::channel();
+    let wrote=std::cell::Cell::new(false);
+    let writing=async { started.send(()).unwrap();ready.await.unwrap();wrote.set(true);Ok(()) };
+    let preparing=async { start.await.unwrap();prepared.send(()).unwrap();
+        Err::<(),failure::Error>(io::Error::other("synthetic lookahead failure").into()) };
+    let result=tokio::time::timeout(std::time::Duration::from_secs(1),prefetch_while_writing(writing,preparing)).await.unwrap();
+    assert!(result.is_err());assert!(wrote.get(),"lookahead failure must not drop the preceding write");
+}
+
+#[tokio::test]
+async fn streaming_update_pipeline_write_failure_cancels_lookahead_without_detached_work() {
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {fn drop(&mut self){self.0.store(true,Ordering::SeqCst);}}
+    let dropped=Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard=DropFlag(dropped.clone());
+    let preparing=async move {let _guard=guard;std::future::pending::<Result<(),failure::Error>>().await};
+    let result=prefetch_while_writing(async {Err(io::Error::other("synthetic output failure").into())},preparing).await;
+    assert!(result.is_err());assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn streaming_update_pipeline_checkpoint_failure_is_not_retried() {
+    let root=tempfile::tempdir().unwrap();let length=33*1024*1024;
+    let source=root.path().join("installed");let body=vec![37;length];fs::write(&source,&body).unwrap();
+    let digest=msixvc::streaming::resume_digest(&body[..PAGE_SIZE]);
+    let hash=std::array::from_fn(|n|u8::from_str_radix(&digest[n*2..n*2+2],16).unwrap());
+    let file=SegmentFile {offset:0,length:length as u64,keep_encrypted:true,data_hashs:vec![hash;length/PAGE_SIZE]};
+    let target=root.path().join("staged");let mut out=tokio::fs::File::create(&target).await.unwrap();
+    let (_control,pause)=watch::channel(false);let (tx,mut rx)=tokio::sync::mpsc::channel(64);
+    let mut calls=0;
+    let result=transfer(&xvd().await,&reqwest::Client::new(),"http://127.0.0.1:1/not-requested",
+        &source,Some(&file),&file,&mut out,[0;32],0,pause,8,&tx,0,|proof|{
+            assert_eq!(proof.position(),32*1024*1024);calls+=1;Err(io::Error::other("synthetic journal failure"))
+        }).await;
+    assert!(result.is_err());assert_eq!(calls,1,"journal failures must not trigger an implicit retry");
+    out.flush().await.unwrap();assert_eq!(fs::metadata(target).unwrap().len(),32*1024*1024);
+    let mut reused=0;while let Ok(event)=rx.try_recv(){if let ProgressEvent::Traffic {network,reused:r}=event {assert_eq!(network,0);reused+=r;}}
+    assert_eq!(reused,32*1024*1024);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn streaming_update_pipeline_pause_keeps_lookahead_out_of_progress_and_resume_checkpoint() {
+    let root=tempfile::tempdir().unwrap();
+    let length=33*1024*1024;
+    let source=root.path().join("installed");
+    let body=vec![37;length];fs::write(&source,&body).unwrap();
+    let digest=msixvc::streaming::resume_digest(&body[..PAGE_SIZE]);
+    let hash=std::array::from_fn(|n|u8::from_str_radix(&digest[n*2..n*2+2],16).unwrap());
+    let file=SegmentFile {offset:0,length:length as u64,keep_encrypted:true,data_hashs:vec![hash;length/PAGE_SIZE]};
+    let files=HashMap::from([("staged".to_owned(),segment(length,true))]);
+    let mut journal=resume::Journal::open(root.path(),"pipeline-pause",&files).unwrap();
+    let target=root.path().join("staged");
+    let mut out=tokio::fs::File::create(&target).await.unwrap();
+    let (control,pause)=watch::channel(false);let (stop,stopped)=watch::channel(false);
+    let (done,wait)=tokio::sync::oneshot::channel();let mut done=Some(done);
+    let (tx,mut rx)=tokio::sync::mpsc::channel(64);
+    let client=reqwest::Client::new();let xvd=xvd().await;
+    let operation=failure::run_or_cancel(stopped,transfer(&xvd,&client,"http://127.0.0.1:1/not-requested",
+        &source,Some(&file),&file,&mut out,[0;32],0,pause.clone(),8,&tx,0,|proof|{
+            let position=proof.position();journal.checkpoint_synced("staged",proof)?;
+            if position==32*1024*1024 {control.send(true).unwrap();if let Some(done)=done.take(){done.send(()).unwrap();}}
+            Ok(())
+        }));
+    let driver=async {wait.await.unwrap();tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(fs::metadata(&target).unwrap().len(),32*1024*1024);
+        stop.send(true).unwrap();};
+    let (result,())=tokio::time::timeout(std::time::Duration::from_secs(5),async{tokio::join!(operation,driver)}).await.unwrap();
+    assert!(result.is_err());out.flush().await.unwrap();
+    assert_eq!(journal.offset("staged",file.length),32*1024*1024);
+    let mut reused=0;while let Ok(event)=rx.try_recv(){if let ProgressEvent::Traffic {network,reused:r}=event {assert_eq!(network,0);reused+=r;}}
+    assert_eq!(reused,32*1024*1024,"prefetched final MiB is not progress");
+    control.send(false).unwrap();let offset=journal.offset("staged",file.length);
+    assert_eq!(resume::prepare_output(&mut out,offset,&file).await.unwrap(),offset);
+    transfer(&xvd,&client,"http://127.0.0.1:1/not-requested",&source,Some(&file),&file,
+        &mut out,[0;32],offset,pause,8,&tx,0,|proof|journal.checkpoint_synced("staged",proof)).await.unwrap();
+    out.flush().await.unwrap();journal.checkpoint("staged",file.length).unwrap();
+    assert_eq!(fs::read(target).unwrap(),body);
+    assert_eq!(journal.offset("staged",file.length),file.length);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "synthetic reused-data disk benchmark, no game or account"]
+async fn streaming_update_reused_disk_benchmark() {
+    use std::io::Write;
+    let parent=std::env::var_os("NEXUS_BENCH_ROOT").expect("explicit fresh fixture parent required");
+    let root=tempfile::Builder::new().prefix("reuse-").tempdir_in(parent).unwrap();
+    let length=512*1024*1024;
+    let source=root.path().join("installed.bin");
+    let mut disk=std::io::BufWriter::with_capacity(1024*1024,fs::File::create(&source).unwrap());
+    let mut hashes=Vec::with_capacity(length/PAGE_SIZE);
+    for n in 0..length/PAGE_SIZE {
+        let mut page=[0u8;PAGE_SIZE];let mut seed=n as u64+1;
+        for word in page.chunks_exact_mut(8) {
+            seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;word.copy_from_slice(&seed.to_le_bytes());
+        }
+        disk.write_all(&page).unwrap();
+        let digest=msixvc::streaming::resume_digest(&page);
+        hashes.push(std::array::from_fn(|n|u8::from_str_radix(&digest[n*2..n*2+2],16).unwrap()));
+    }
+    disk.flush().unwrap();disk.get_ref().sync_all().unwrap();drop(disk);
+    let file=SegmentFile {offset:0,length:length as u64,keep_encrypted:true,data_hashs:hashes};
+    let files=HashMap::from([("staged".to_owned(),SegmentFile {offset:0,length:file.length,
+        keep_encrypted:true,data_hashs:file.data_hashs.clone()})]);
+    let mut journal=resume::Journal::open(root.path(),"synthetic-reuse",&files).unwrap();
+    let target=root.path().join("staged");
+    let mut out=tokio::fs::File::create(&target).await.unwrap();
+    let xvd=xvd().await;
+    let client=reqwest::Client::new();
+    let (_control,pause)=watch::channel(false);
+    let (tx,mut rx)=tokio::sync::mpsc::channel(256);
+    let started=std::time::Instant::now();
+    let mut checkpoints=0;
+    transfer(&xvd,&client,"http://127.0.0.1:1/not-requested",&source,Some(&file),&file,&mut out,
+        [0;32],0,pause,8,&tx,0,|p|{checkpoints+=1;journal.checkpoint_synced("staged",p)}).await.unwrap();
+    out.flush().await.unwrap();journal.checkpoint("staged",file.length).unwrap();
+    let elapsed=started.elapsed().as_secs_f64();
+    drop(tx);let mut network=0;let mut reused=0;
+    while let Some(event)=rx.recv().await {if let ProgressEvent::Traffic {network:n,reused:r}=event {network+=n;reused+=r;}}
+    assert_eq!((network,reused),(0,file.length));assert_eq!(checkpoints,16);
+    assert_eq!(journal.offset("staged",file.length),file.length);
+    let mut a=fs::File::open(source).unwrap();let mut b=fs::File::open(target).unwrap();
+    let mut aa=vec![0;1024*1024];let mut bb=vec![0;1024*1024];
+    for _ in 0..512 {a.read_exact(&mut aa).unwrap();b.read_exact(&mut bb).unwrap();assert_eq!(aa,bb);}
+    eprintln!("REUSED_DISK_BENCH bytes={length} seconds={elapsed:.6} MiBps={:.2} checkpoints={checkpoints}",512.0/elapsed);
+}
+
 fn segment(length: usize, encrypted: bool) -> SegmentFile {
     SegmentFile {
         offset: 0,
@@ -24,24 +167,28 @@ async fn xvd() -> XvdFile {
         .unwrap()
 }
 
-#[test]
-fn streaming_update_throughput_prefers_same_position_and_reads_contiguous_pages_once() {
+#[tokio::test]
+async fn streaming_update_throughput_prefers_same_position_and_reads_contiguous_pages_once() {
     struct Count {
         data: std::io::Cursor<Vec<u8>>,
         bytes: usize,
         reads: usize,
     }
-    impl Read for Count {
-        fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
+    impl tokio::io::AsyncRead for Count {
+        fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, data: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
             self.reads += 1;
-            let n = std::io::Read::read(&mut self.data, data)?;
-            self.bytes += n;
-            Ok(n)
+            let before=data.filled().len();
+            let result=std::pin::Pin::new(&mut self.data).poll_read(cx,data);
+            self.bytes += data.filled().len()-before;
+            result
         }
     }
-    impl Seek for Count {
-        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-            self.data.seek(position)
+    impl tokio::io::AsyncSeek for Count {
+        fn start_seek(mut self:std::pin::Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+            std::pin::Pin::new(&mut self.data).start_seek(position)
+        }
+        fn poll_complete(mut self:std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<u64>> {
+            std::pin::Pin::new(&mut self.data).poll_complete(cx)
         }
     }
     // Every page shares a hash, the old first-match index would select page0
@@ -60,6 +207,7 @@ fn streaming_update_throughput_prefers_same_position_and_reads_contiguous_pages_
     let mut output = vec![0; data.len()];
     assert!(
         read_local_pages(&mut reader, &mut output, &candidates)
+            .await
             .into_iter()
             .all(|read| read)
     );
@@ -69,9 +217,9 @@ fn streaming_update_throughput_prefers_same_position_and_reads_contiguous_pages_
         &mut reader,
         &mut [0; PAGE_SIZE * 4],
         &[Some(2), None, Some(0), Some(1)],
-    );
+    ).await;
     assert_eq!(partial, [true, false, true, true]);
-    assert!(!read_local_pages(&mut reader, &mut [0; PAGE_SIZE], &[Some(9999)])[0]);
+    assert!(!read_local_pages(&mut reader, &mut [0; PAGE_SIZE], &[Some(9999)]).await[0]);
 }
 
 #[test]
@@ -184,7 +332,7 @@ async fn streaming_update_throughput_parallel_ranges_preserve_plain_and_cipherte
                     &tx,
                     0,
                     |p| {
-                        checkpoints.push(p);
+                        checkpoints.push(p.position());
                         Ok(())
                     },
                 ),
@@ -248,7 +396,7 @@ async fn streaming_update_throughput_failed_window_resumes_only_durable_contiguo
             4,
             &tx,
             0,
-            |p| journal.checkpoint("staged", p),
+            |p| journal.checkpoint_synced("staged", p),
         ),
     )
     .await
@@ -278,7 +426,7 @@ async fn streaming_update_throughput_failed_window_resumes_only_durable_contiguo
             4,
             &tx,
             0,
-            |p| journal.checkpoint("staged", p),
+            |p| journal.checkpoint_synced("staged", p),
         ),
     )
     .await
@@ -346,7 +494,7 @@ async fn streaming_update_throughput_pause_and_cancellation_never_claim_prefetch
             &tx,
             0,
             |p| {
-                checkpoints.push(p);
+                checkpoints.push(p.position());
                 Ok(())
             },
         ),

@@ -625,7 +625,7 @@ where
             if stage.is_some() && !url.starts_with("file://") {
                 update::transfer(remote_xvd_ref,&client,url,&resume::target(out,&job.name)?,old,
                     full_content,&mut fout,*full_key,offset,pause.clone(),parallel.unwrap_or(4),&tx,id,
-                    |position|journal.lock().unwrap().checkpoint(&job.name,position)).await?;
+                    |synced|journal.lock().unwrap().checkpoint_synced(&job.name,synced)).await?;
             } else if let Some(fpath) = url.strip_prefix("file://") {
                 let mut i = File::open(&fpath).await?;
                 remote_xvd_ref

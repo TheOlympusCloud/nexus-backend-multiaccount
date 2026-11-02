@@ -16,6 +16,31 @@ pub(super) struct Journal {
 
 pub(super) struct Identity(String);
 
+/// A data sync completed on this exact output inode before its journal entry.
+/// Fields are private so callers cannot claim that unsynced bytes are durable.
+pub(super) struct SyncedCheckpoint {
+    offset: u64,
+    device: u64,
+    inode: u64,
+}
+
+impl SyncedCheckpoint {
+    #[cfg(test)]
+    pub(super) fn position(&self) -> u64 { self.offset }
+}
+
+pub(super) async fn sync_output(file: &mut tokio::fs::File, offset: u64) -> io::Result<SyncedCheckpoint> {
+    use std::os::unix::fs::MetadataExt;
+    use tokio::io::AsyncWriteExt;
+    file.flush().await?;
+    file.sync_data().await?;
+    let meta = file.metadata().await?;
+    if !meta.is_file() || meta.len() < offset {
+        return Err(io::Error::other("checkpoint output is incomplete"));
+    }
+    Ok(SyncedCheckpoint { offset, device:meta.dev(), inode:meta.ino() })
+}
+
 /// Preserve completed ciphertext pages, trim only uncommitted data. Return the
 /// logical offset to resume from, which can rewind an old truncated final page.
 pub(super) async fn prepare_output(
@@ -290,6 +315,20 @@ impl Journal {
         let file = target(&self.root, name)?;
         // File data reaches storage before the journal claims it can be resumed.
         File::open(&file)?.sync_data()?;
+        self.append_checkpoint(name, &file, offset)
+    }
+
+    pub(super) fn checkpoint_synced(&mut self, name: &str, synced: SyncedCheckpoint) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let file = target(&self.root, name)?;
+        let meta = fs::metadata(&file)?;
+        if !meta.is_file() || meta.dev() != synced.device || meta.ino() != synced.inode || meta.len() < synced.offset {
+            return Err(io::Error::other("checkpoint output changed after data sync"));
+        }
+        self.append_checkpoint(name, &file, synced.offset)
+    }
+
+    fn append_checkpoint(&mut self, name: &str, file: &Path, offset: u64) -> io::Result<()> {
         let digest = tail(&file, offset)?;
         let entry = serde_json::json!({"offset": offset, "tailSha256": digest});
         let path = target(&self.root, ".nexus-streaming-v1.jsonl")?;
@@ -346,6 +385,30 @@ fn tail(path: &Path, offset: u64) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streaming_resume_synced_proof_binds_exact_output_and_preserves_legacy_journal() {
+        use tokio::io::AsyncWriteExt;
+        let root=tempfile::tempdir().unwrap();
+        let files=HashMap::from([("a".to_owned(),SegmentFile {offset:0,length:8192,keep_encrypted:false,data_hashs:vec![]})]);
+        let mut journal=Journal::open(root.path(),"proof",&files).unwrap();
+        fs::write(root.path().join("b"),vec![19;8192]).unwrap();
+        let mut out=tokio::fs::File::create(root.path().join("a")).await.unwrap();
+        out.write_all(&vec![19;8192]).await.unwrap();
+        let wrong=sync_output(&mut out,4096).await.unwrap();
+        assert!(journal.checkpoint_synced("b",wrong).is_err());
+        assert_eq!(journal.offset("b",8192),0);
+        let proof=sync_output(&mut out,4096).await.unwrap();
+        journal.checkpoint_synced("a",proof).unwrap();drop(journal);
+        let mut journal=Journal::open(root.path(),"proof",&files).unwrap();
+        assert_eq!(journal.offset("a",8192),4096);
+        let replaced=sync_output(&mut out,8192).await.unwrap();
+        fs::rename(root.path().join("a"),root.path().join("old-a")).unwrap();
+        fs::write(root.path().join("a"),vec![19;8192]).unwrap();
+        assert!(journal.checkpoint_synced("a",replaced).is_err(),"same bytes on another inode are not a data-sync proof");
+        out.set_len(1024).await.unwrap();
+        assert!(sync_output(&mut out,4096).await.is_err());
+    }
     fn legacy_identity(content: &str, files: &HashMap<String, SegmentFile>) -> String {
         let mut layout: Vec<_> = files.iter()
             .map(|(name, f)| (name, f.offset, f.length, f.keep_encrypted, &f.data_hashs)).collect();

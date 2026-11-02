@@ -2,16 +2,18 @@
 use super::{ProgressEvent, failure, resume};
 use msixvc::{
     layout::PAGE_SIZE,
-    xvd::{SegmentFile, XvdFile},
+    xvd::{SegmentFile, StoredPageVerifier, XvdFile},
 };
 use std::{
     collections::HashMap,
     fs,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, SeekFrom},
     path::{Path, PathBuf},
 };
+#[cfg(test)]
+use std::io::Read;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt},
     sync::{mpsc::Sender, watch},
 };
 
@@ -155,7 +157,7 @@ fn local_candidates(old: &SegmentFile, file: &SegmentFile, index: &HashMap<[u8;2
     }).collect()
 }
 
-fn read_local_pages(input: &mut (impl Read + Seek), data: &mut [u8], candidates: &[Option<u64>]) -> Vec<bool> {
+async fn read_local_pages(input: &mut (impl AsyncRead + AsyncSeek + Unpin), data: &mut [u8], candidates: &[Option<u64>]) -> Vec<bool> {
     let mut read = vec![false; candidates.len()];
     let mut n = 0;
     while n < candidates.len() {
@@ -163,12 +165,74 @@ fn read_local_pages(input: &mut (impl Read + Seek), data: &mut [u8], candidates:
         n += 1;
         let Some(page) = candidates[begin] else { continue };
         while n < candidates.len() && candidates[n] == Some(page + (n - begin) as u64) { n += 1; }
-        if input.seek(SeekFrom::Start(page * PAGE_SIZE as u64))
-            .and_then(|_| input.read_exact(&mut data[begin * PAGE_SIZE..n * PAGE_SIZE])).is_ok() {
+        if input.seek(SeekFrom::Start(page * PAGE_SIZE as u64)).await.is_ok()
+            && input.read_exact(&mut data[begin * PAGE_SIZE..n * PAGE_SIZE]).await.is_ok() {
             read[begin..n].fill(true);
         }
     }
     read
+}
+
+fn lazy_candidates(old: &SegmentFile, file: &SegmentFile, index: &mut Option<HashMap<[u8;20], u64>>, start: usize, pages: usize) -> Vec<Option<u64>> {
+    let relocated = (start..start + pages).any(|n| file.data_hashs.get(n)
+        .is_some_and(|hash| old.data_hashs.get(n) != Some(hash)));
+    if relocated && index.is_none() {
+        let mut entries = HashMap::new();
+        for (page,hash) in old.data_hashs.iter().enumerate() { entries.entry(*hash).or_insert(page as u64); }
+        *index = Some(entries);
+    }
+    local_candidates(old, file, index.as_ref().unwrap_or(&HashMap::new()), start, pages)
+}
+
+const REUSE_WINDOW: usize = 8 * 1024 * 1024;
+
+struct LocalWindow {
+    start: u64,
+    logical: u64,
+    data: Vec<u8>,
+    reused: Vec<bool>,
+}
+
+// A prefetched window is only memory, not completed progress or durable data.
+// One producer is borrowed by this future, never a detached thread/task.
+async fn prepare_local_window(
+    source: &mut Option<tokio::fs::File>,
+    old: Option<&SegmentFile>,
+    file: &SegmentFile,
+    verifier: &StoredPageVerifier<'_>,
+    index: &mut Option<HashMap<[u8;20], u64>>,
+    start: u64,
+) -> Result<Option<LocalWindow>, failure::Error> {
+    if start >= file.length { return Ok(None); }
+    let bytes = (file.stored_length()? - start).min(REUSE_WINDOW as u64) as usize;
+    let pages = bytes.div_ceil(PAGE_SIZE);
+    let mut data = vec![0u8; pages * PAGE_SIZE];
+    let mut reused = vec![false; pages];
+    if let (Some(input), Some(old)) = (source.as_mut(), old) {
+        let first = (start / PAGE_SIZE as u64) as usize;
+        let candidates = tokio::task::block_in_place(|| lazy_candidates(old,file,index,first,pages));
+        reused = read_local_pages(input, &mut data, &candidates).await;
+        tokio::task::block_in_place(|| {
+            for (n,page) in data.chunks_exact(PAGE_SIZE).enumerate() {
+                if reused[n] { reused[n] = verifier.matches(first + n, page.try_into().unwrap()); }
+            }
+        });
+    }
+    Ok(Some(LocalWindow { start, logical: (bytes as u64).min(file.length-start), data, reused }))
+}
+
+// A failed lookahead must still settle the current write. A failed write must
+// cancel lookahead immediately, without counting or checkpointing those bytes.
+async fn prefetch_while_writing<T>(
+    writing: impl std::future::Future<Output = Result<(),failure::Error>>,
+    preparing: impl std::future::Future<Output = Result<T,failure::Error>>,
+) -> Result<T,failure::Error> {
+    tokio::pin!(writing,preparing);
+    tokio::select! {
+        biased;
+        done = &mut writing => { done?; preparing.await }
+        next = &mut preparing => { writing.await?; next }
+    }
 }
 
 // Coalesce tiny reused islands as before, then bound each concurrent request's
@@ -207,46 +271,32 @@ pub(super) async fn transfer(
     parallel: usize,
     tx: &Sender<ProgressEvent>,
     id: usize,
-    mut checkpoint: impl FnMut(u64) -> io::Result<()>,
+    mut checkpoint: impl FnMut(resume::SyncedCheckpoint) -> io::Result<()>,
 ) -> Result<(), failure::Error> {
+    if offset >= file.length { return Ok(()); }
     let mut source = None;
-    let mut index = HashMap::new();
-    if let Some(old) = old.filter(|old| old.keep_encrypted == file.keep_encrypted) {
-        if let Ok(input) = fs::File::open(installed) {
-            if input.metadata()?.is_file() {
-                for (page, hash) in old.data_hashs.iter().enumerate() {
-                    index.entry(*hash).or_insert(page as u64);
-                }
+    let mut index = None;
+    if old.is_some_and(|old| old.keep_encrypted == file.keep_encrypted) {
+        if let Ok(input) = tokio::fs::File::open(installed).await {
+            if input.metadata().await?.is_file() {
                 source = Some(input);
             }
         }
     }
     let verifier = xvd.stored_page_verifier(file, key);
     let mut last_checkpoint = offset;
-    const WINDOW: usize = 8 * 1024 * 1024;
-    while offset < file.length {
+    pause.wait_for(|paused| !*paused).await.ok();
+    let mut next = prepare_local_window(&mut source,old,file,&verifier,&mut index,offset).await?;
+    while let Some(current) = next {
         if *pause.borrow() {
-            out.flush().await?;
-            checkpoint(offset)?;
+            checkpoint(resume::sync_output(out,offset).await?)?;
             last_checkpoint = offset;
         }
         pause.wait_for(|paused| !*paused).await.ok();
-        let start = offset;
-        let bytes = (file.stored_length()? - start).min(WINDOW as u64) as usize;
-        let pages = bytes.div_ceil(PAGE_SIZE);
-        let mut data = vec![0u8; pages * PAGE_SIZE];
-        let mut reused = vec![false; pages];
-        tokio::task::block_in_place(|| {
-            if let (Some(input), Some(old)) = (source.as_mut(), old) {
-                let candidates = local_candidates(old, file, &index, (start / PAGE_SIZE as u64) as usize, pages);
-                reused = read_local_pages(input, &mut data, &candidates);
-                for (n, page) in data.chunks_exact(PAGE_SIZE).enumerate() {
-                    if !reused[n] { continue; }
-                    let position = (start / PAGE_SIZE as u64) as usize + n;
-                    reused[n] = verifier.matches(position, page.try_into().unwrap());
-                }
-            }
-        });
+        let following = current.start + current.logical;
+        let preparing = prepare_local_window(&mut source,old,file,&verifier,&mut index,following);
+        let writing = async {
+        let LocalWindow {start,logical,mut data,reused} = current;
         use futures_util::{StreamExt, TryStreamExt};
         let fetched: Result<Vec<_>, failure::Error> = futures_util::stream::iter(missing_ranges(&reused))
             .map(|range| {
@@ -282,10 +332,9 @@ pub(super) async fn transfer(
             .buffer_unordered(parallel.clamp(1, 8))
             .try_collect().await;
         let fetched = match fetched {
-            Ok(value) => value,
+            Ok(fetched) => fetched,
             Err(error) => {
-                out.flush().await?;
-                checkpoint(offset)?;
+                checkpoint(resume::sync_output(out,offset).await?)?;
                 return Err(error);
             }
         };
@@ -295,18 +344,23 @@ pub(super) async fn transfer(
             network += logical;
         }
         pause.wait_for(|paused| !*paused).await.ok();
-        let logical = (pages * PAGE_SIZE) as u64;
-        let logical = logical.min(file.length - start);
-        let physical = if file.keep_encrypted { pages * PAGE_SIZE } else { logical as usize };
+        let physical = if file.keep_encrypted { data.len() } else { logical as usize };
         out.write_all(&data[..physical]).await?;
         tx.send(ProgressEvent::Traffic { network, reused: logical - network }).await.ok();
         tx.send(ProgressEvent::Advanced { id, delta: logical }).await.ok();
         offset = start + logical;
         if offset - last_checkpoint >= 32 * 1024 * 1024 {
-            out.flush().await?;
-            checkpoint(offset)?;
+            // Data sync can overlap the one-window lookahead. Its opaque proof
+            // binds the journal append to this inode and exact written prefix.
+            checkpoint(resume::sync_output(out,offset).await?)?;
             last_checkpoint = offset;
         }
+        Ok(())
+        };
+        next = match prefetch_while_writing(writing,preparing).await {
+            Ok(next) => next,
+            Err(error) => { out.flush().await?; return Err(error); }
+        };
     }
     Ok(())
 }
