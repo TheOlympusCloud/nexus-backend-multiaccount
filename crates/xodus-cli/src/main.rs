@@ -249,9 +249,13 @@ async fn main() -> ExitCode {
     {
         registry.init();
     }
+    // Connects are bounded so an unreachable Microsoft is detected in seconds
+    // (offline launches then fall back to the stored license at once); no
+    // overall request timeout, because this client also streams game data.
     let client = reqwest::ClientBuilder::new()
         .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
         .connection_verbose(true)
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();
     let args = CliArgs::parse();

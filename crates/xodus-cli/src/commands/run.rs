@@ -916,11 +916,15 @@ pub async fn run(
         .arg(&stub_path)
         .env("WINE_DLL_FILE_MAP", env_value)
         .env("WINE_EXE_FILE_MAP", exe_env_value);
-    match playfab_auth_header(client, tokens).await {
-        Some(header) => {
-            command.env("XODUS_XSTS_PLAYFAB", header);
+    if crate::license::OFFLINE_LICENSE_USED.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("Microsoft is unreachable; skipping PlayFab authorisation (the runtime signs in with its cached identity)");
+    } else {
+        match playfab_auth_header(client, tokens).await {
+            Some(header) => {
+                command.env("XODUS_XSTS_PLAYFAB", header);
+            }
+            None => eprintln!("could not authorise a PlayFab token; in-game sign-in may fail"),
         }
-        None => eprintln!("could not authorise a PlayFab token; in-game sign-in may fail"),
     }
 
     let mut wn = match command.spawn() {

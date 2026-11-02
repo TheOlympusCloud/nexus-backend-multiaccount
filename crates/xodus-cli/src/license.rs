@@ -115,6 +115,11 @@ fn record_license(root: &Path, content_id: &str, puid: &str, market: &str, licen
 
 /// Decides whether a stored offline license may stand in for the failed
 /// online request. Only an unreachable service qualifies; refusals purge.
+/// Set once a launch continues on the stored offline license, so later
+/// online-only steps of the same launch (PlayFab authorisation) are skipped
+/// instead of waiting for their own timeouts.
+pub static OFFLINE_LICENSE_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn recover_offline(
     tokens: &TokenManager,
     cache: Option<&Path>,
@@ -140,6 +145,7 @@ pub fn recover_offline(
             };
             match LicenseCache::new(root).load(content_id, puid, now) {
                 Ok(Some(entry)) => {
+                    OFFLINE_LICENSE_USED.store(true, std::sync::atomic::Ordering::Relaxed);
                     diagnostic("content-cache-used");
                     eprintln!(
                         "Microsoft content licensing is unreachable; using the offline license stored on this device (valid for {} more day(s)).",
@@ -421,6 +427,8 @@ mod tests {
         assert!(!error.contains("Could not connect"), "{error}");
         assert!(!error.contains("offline license is stored"), "{error}");
         assert!(root.path().join("content-a.json").exists());
+        // The launch now runs on the stored license; later online-only steps skip their timeouts.
+        assert!(OFFLINE_LICENSE_USED.load(std::sync::atomic::Ordering::Relaxed));
 
         // No cache directory, another account or no entry keep the original failure.
         for (cache_root, puid, content) in [
