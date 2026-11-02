@@ -15,6 +15,10 @@ use tokio::{
     sync::{mpsc::Sender, watch},
 };
 
+#[cfg(test)]
+#[path = "streaming_update_throughput_tests.rs"]
+mod throughput_tests;
+
 pub(super) fn staging(root: &Path) -> io::Result<PathBuf> {
     let path = resume::target(root, ".nexus-update-v1")?;
     match fs::create_dir(&path) {
@@ -141,6 +145,54 @@ pub(super) fn completed(
             .is_ok_and(|m| m.is_file() && m.len() == file.stored_length().unwrap_or(u64::MAX))
 }
 
+// Prefer the same position before a duplicate elsewhere. Read adjacent source
+// pages together, without a large read-ahead buffer on random relocated pages.
+fn local_candidates(old: &SegmentFile, file: &SegmentFile, index: &HashMap<[u8;20], u64>, start: usize, pages: usize) -> Vec<Option<u64>> {
+    (start..start + pages).map(|position| {
+        let hash = file.data_hashs.get(position)?;
+        if old.data_hashs.get(position) == Some(hash) { Some(position as u64) }
+        else { index.get(hash).copied() }
+    }).collect()
+}
+
+fn read_local_pages(input: &mut (impl Read + Seek), data: &mut [u8], candidates: &[Option<u64>]) -> Vec<bool> {
+    let mut read = vec![false; candidates.len()];
+    let mut n = 0;
+    while n < candidates.len() {
+        let begin = n;
+        n += 1;
+        let Some(page) = candidates[begin] else { continue };
+        while n < candidates.len() && candidates[n] == Some(page + (n - begin) as u64) { n += 1; }
+        if input.seek(SeekFrom::Start(page * PAGE_SIZE as u64))
+            .and_then(|_| input.read_exact(&mut data[begin * PAGE_SIZE..n * PAGE_SIZE])).is_ok() {
+            read[begin..n].fill(true);
+        }
+    }
+    read
+}
+
+// Coalesce tiny reused islands as before, then bound each concurrent request's
+// memory. Never read ahead beyond the current8MiB reconstruction window.
+fn missing_ranges(reused: &[bool]) -> Vec<std::ops::Range<usize>> {
+    const MAX_PAGES: usize = 1024 * 1024 / PAGE_SIZE;
+    let mut ranges = Vec::new();
+    let mut n = 0;
+    while n < reused.len() {
+        if reused[n] { n += 1; continue; }
+        let begin = n;
+        while n < reused.len() && !reused[n] && n - begin < MAX_PAGES { n += 1; }
+        while n - begin < MAX_PAGES {
+            let mut end = n;
+            while end < reused.len() && reused[end] { end += 1; }
+            if end == reused.len() || end - n > 16 || end - begin >= MAX_PAGES { break; }
+            n = end;
+            while n < reused.len() && !reused[n] && n - begin < MAX_PAGES { n += 1; }
+        }
+        ranges.push(begin..n);
+    }
+    ranges
+}
+
 pub(super) async fn transfer(
     xvd: &XvdFile,
     client: &reqwest::Client,
@@ -152,6 +204,7 @@ pub(super) async fn transfer(
     key: [u8; 32],
     mut offset: u64,
     mut pause: watch::Receiver<bool>,
+    parallel: usize,
     tx: &Sender<ProgressEvent>,
     id: usize,
     mut checkpoint: impl FnMut(u64) -> io::Result<()>,
@@ -164,16 +217,19 @@ pub(super) async fn transfer(
                 for (page, hash) in old.data_hashs.iter().enumerate() {
                     index.entry(*hash).or_insert(page as u64);
                 }
-                source = Some(std::io::BufReader::with_capacity(1024 * 1024, input));
+                source = Some(input);
             }
         }
     }
     let verifier = xvd.stored_page_verifier(file, key);
-    let mut read_position = u64::MAX;
     let mut last_checkpoint = offset;
     const WINDOW: usize = 8 * 1024 * 1024;
-    const MERGE_PAGES: usize = 16;
     while offset < file.length {
+        if *pause.borrow() {
+            out.flush().await?;
+            checkpoint(offset)?;
+            last_checkpoint = offset;
+        }
         pause.wait_for(|paused| !*paused).await.ok();
         let start = offset;
         let bytes = (file.stored_length()? - start).min(WINDOW as u64) as usize;
@@ -181,105 +237,75 @@ pub(super) async fn transfer(
         let mut data = vec![0u8; pages * PAGE_SIZE];
         let mut reused = vec![false; pages];
         tokio::task::block_in_place(|| {
-            if let Some(input) = source.as_mut() {
-                for (n, page) in data.chunks_exact_mut(PAGE_SIZE).enumerate() {
+            if let (Some(input), Some(old)) = (source.as_mut(), old) {
+                let candidates = local_candidates(old, file, &index, (start / PAGE_SIZE as u64) as usize, pages);
+                reused = read_local_pages(input, &mut data, &candidates);
+                for (n, page) in data.chunks_exact(PAGE_SIZE).enumerate() {
+                    if !reused[n] { continue; }
                     let position = (start / PAGE_SIZE as u64) as usize + n;
-                    let Some(candidate) = file
-                        .data_hashs
-                        .get(position)
-                        .and_then(|hash| index.get(hash))
-                    else {
-                        continue;
-                    };
-                    let wanted = candidate * PAGE_SIZE as u64;
-                    let read = (|| -> io::Result<()> {
-                        if read_position != wanted {
-                            input.seek(SeekFrom::Start(wanted))?;
-                        }
-                        input.read_exact(page)?;
-                        read_position = wanted + PAGE_SIZE as u64;
-                        Ok(())
-                    })();
-                    if read.is_err() {
-                        read_position = u64::MAX;
-                        continue;
-                    }
-                    reused[n] = verifier.matches(position, (&*page).try_into().unwrap());
+                    reused[n] = verifier.matches(position, page.try_into().unwrap());
                 }
             }
         });
-        let mut n = 0;
-        while n < pages {
-            let local = reused[n];
-            let begin = n;
-            n += 1;
-            while n < pages && reused[n] == local {
-                n += 1;
-            }
-            if !local {
-                // Coalesce tiny reusable islands rather than issue thousands of 4K requests.
-                loop {
-                    let mut end = n;
-                    while end < pages && reused[end] {
-                        end += 1;
-                    }
-                    if end == pages || end - n > MERGE_PAGES {
-                        break;
-                    }
-                    n = end;
-                    while n < pages && !reused[n] {
-                        n += 1;
-                    }
-                }
-            }
-            let base = start + (begin * PAGE_SIZE) as u64;
-            let length = ((n - begin) * PAGE_SIZE) as u64;
-            let logical = length.min(file.length - base);
-            if local {
-                let physical = if file.keep_encrypted { length } else { logical } as usize;
-                out.write_all(&data[begin * PAGE_SIZE..begin * PAGE_SIZE + physical])
-                    .await?;
-                tx.send(ProgressEvent::Traffic {
-                    network: 0,
-                    reused: logical,
-                })
-                .await
-                .ok();
-            } else {
+        use futures_util::{StreamExt, TryStreamExt};
+        let fetched: Result<Vec<_>, failure::Error> = futures_util::stream::iter(missing_ranges(&reused))
+            .map(|range| {
+                let pause = pause.clone();
+                async move {
+                let base = start + (range.start * PAGE_SIZE) as u64;
+                let length = (range.len() * PAGE_SIZE) as u64;
+                let logical = length.min(file.length - base);
                 let segment = SegmentFile {
                     offset: file.offset + base,
                     length: logical,
                     keep_encrypted: file.keep_encrypted,
                     data_hashs: vec![],
                 };
+                let mut buffer = Vec::with_capacity(length as usize);
                 xvd.download_file_http(
                     client,
                     url,
-                    out,
+                    &mut buffer,
                     &segment,
                     key,
                     |_, _| {},
-                    Some(pause.clone()),
+                    Some(pause),
                     0,
-                    |n| checkpoint(base + n),
+                    |_| Ok(()), // Memory is not a durable file checkpoint.
                 )
                 .await?;
-                tx.send(ProgressEvent::Traffic {
-                    network: logical,
-                    reused: 0,
-                })
-                .await
-                .ok();
-            }
-            tx.send(ProgressEvent::Advanced { id, delta: logical })
-                .await
-                .ok();
-            offset = base + logical;
-            if offset - last_checkpoint >= 32 * 1024 * 1024 {
+                if buffer.len() != if file.keep_encrypted { length } else { logical } as usize {
+                    return Err(io::Error::other("incomplete update range").into());
+                }
+                Ok((range.start * PAGE_SIZE, buffer, logical))
+            }})
+            .buffer_unordered(parallel.clamp(1, 8))
+            .try_collect().await;
+        let fetched = match fetched {
+            Ok(value) => value,
+            Err(error) => {
                 out.flush().await?;
                 checkpoint(offset)?;
-                last_checkpoint = offset;
+                return Err(error);
             }
+        };
+        let mut network = 0;
+        for (begin, buffer, logical) in fetched {
+            data[begin..begin + buffer.len()].copy_from_slice(&buffer);
+            network += logical;
+        }
+        pause.wait_for(|paused| !*paused).await.ok();
+        let logical = (pages * PAGE_SIZE) as u64;
+        let logical = logical.min(file.length - start);
+        let physical = if file.keep_encrypted { pages * PAGE_SIZE } else { logical as usize };
+        out.write_all(&data[..physical]).await?;
+        tx.send(ProgressEvent::Traffic { network, reused: logical - network }).await.ok();
+        tx.send(ProgressEvent::Advanced { id, delta: logical }).await.ok();
+        offset = start + logical;
+        if offset - last_checkpoint >= 32 * 1024 * 1024 {
+            out.flush().await?;
+            checkpoint(offset)?;
+            last_checkpoint = offset;
         }
     }
     Ok(())
@@ -416,7 +442,7 @@ mod tests {
             let (tx, _rx) = tokio::sync::mpsc::channel(16);
             tokio::time::timeout(std::time::Duration::from_secs(2), transfer(&xvd, &reqwest::Client::new(),
                 "http://127.0.0.1:9/must-not-download", &installed, Some(&file), &file,
-                &mut out, [0;32], offset, pause, &tx, 0, |_| Ok(()))).await.unwrap().unwrap();
+                &mut out, [0;32], offset, pause, 4, &tx, 0, |_| Ok(()))).await.unwrap().unwrap();
             out.flush().await.unwrap();
             assert_eq!(fs::read(&target).unwrap(), bytes, "the physical ciphertext tail must not be truncated to 5000 logical bytes");
             assert_eq!(fs::read(&installed).unwrap(), bytes);
@@ -547,6 +573,7 @@ mod tests {
                     [0; 32],
                     initial as u64,
                     pause,
+                    4,
                     &tx,
                     0,
                     |n| {
