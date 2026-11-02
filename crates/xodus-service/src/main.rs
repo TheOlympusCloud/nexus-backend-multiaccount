@@ -64,6 +64,7 @@ async fn main() {
     };
 
     let runtime_dir = utils::get_runtime_dir();
+    let context = simple_context::SimpleContext::new(device_token, tokens);
     let cancellation = CancellationToken::new();
     let socket_path = format!("{runtime_dir}/xodus.sock");
     let trigger = cancellation.clone();
@@ -86,10 +87,9 @@ async fn main() {
             .expect("Failed to accept");
 
             let token = cancellation.clone();
-            let device_token = device_token.clone();
-            let tokens = tokens.clone();
+            let context = context.clone();
             tokio::spawn(async move {
-                connection::router::route(accept.0, token, device_token, tokens).await
+                connection::router::route(accept.0, token, context).await
             });
         }
     }

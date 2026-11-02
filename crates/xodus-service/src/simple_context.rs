@@ -5,6 +5,9 @@ use std::{sync::Arc, time::Duration};
 use xodus::models::secrets::LegacyToken;
 use xodus::tokens::TokenManager;
 
+// Clones share the HTTP transport pool and token manager, not mutable per-peer
+// protocol state. Authentication remains attached to individual requests.
+#[derive(Clone)]
 pub struct SimpleContext {
     pub client: reqwest::Client,
     pub device_token: Option<LegacyToken>,
@@ -35,6 +38,103 @@ fn service_client(timeout: Duration) -> reqwest::Client {
         .timeout(timeout)
         .build()
         .unwrap()
+}
+
+#[cfg(test)]
+mod pooling_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
+
+    fn context() -> SimpleContext {
+        SimpleContext::new(
+            LegacyToken {
+                key_name: None,
+                token: "synthetic-device".into(),
+                binary_secret: None,
+                tpm_key: None,
+                lifetime: xodus::models::soap::Timestamp {
+                    id: None,
+                    created: "2026-01-01T00:00:00Z".into(),
+                    expires: "2027-01-01T00:00:00Z".into(),
+                },
+            },
+            Arc::new(TokenManager::with_memory()),
+        )
+    }
+
+    async fn requests(shared: bool) -> (usize, Vec<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let headers = captured.clone();
+        let stop = CancellationToken::new();
+        let shutdown = stop.clone();
+        let server = tokio::spawn(async move {
+            let mut connections = 0;
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                connections += 1;
+                let headers = headers.clone();
+                tasks.spawn(async move {
+                    loop {
+                        let mut request = Vec::new();
+                        loop {
+                            let mut byte = [0];
+                            if socket.read(&mut byte).await.unwrap_or(0) == 0 { return; }
+                            request.push(byte[0]);
+                            assert!(request.len() < 16_384);
+                            if request.ends_with(b"\r\n\r\n") { break; }
+                        }
+                        headers.lock().unwrap().push(String::from_utf8(request).unwrap().to_lowercase());
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: fixture=previous-account\r\n\r\nok").await.unwrap();
+                    }
+                });
+            }
+            tasks.abort_all();
+            while let Some(result) = tasks.join_next().await {
+                if let Err(error) = result { assert!(error.is_cancelled(), "HTTP fixture panicked: {error}"); }
+            }
+            connections
+        });
+        let base = context();
+        for authorization in [Some("Bearer synthetic-a"), Some("Bearer synthetic-b"), None] {
+            let mut peer = if shared { base.clone() } else { context() };
+            peer.device_token = None;
+            assert!(base.device_token.is_some(), "per-peer protocol state leaked into the listener");
+            let mut request = peer.client.get(format!("http://{address}/fixture"));
+            if let Some(value) = authorization { request = request.header("Authorization", value); }
+            assert_eq!(request.send().await.unwrap().text().await.unwrap(), "ok");
+        }
+        stop.cancel();
+        let connections = server.await.unwrap();
+        let headers = captured.lock().unwrap().clone();
+        (connections, headers)
+    }
+
+    #[tokio::test]
+    async fn pooled_transport_reuses_connections_without_carrying_credentials() {
+        let (connections, headers) = tokio::time::timeout(Duration::from_secs(3), requests(true)).await.unwrap();
+        assert_eq!(connections, 1);
+        assert_eq!(headers.len(), 3);
+        assert!(headers[0].contains("authorization: bearer synthetic-a\r\n"));
+        assert!(headers[1].contains("authorization: bearer synthetic-b\r\n"));
+        assert!(!headers[1].contains("synthetic-a"));
+        assert!(!headers[2].contains("authorization:"));
+        for header in headers { assert!(!header.contains("\r\ncookie:")); }
+    }
+
+    #[tokio::test]
+    async fn separate_transports_reproduce_the_previous_connection_overhead() {
+        let (connections, headers) = tokio::time::timeout(Duration::from_secs(3), requests(false)).await.unwrap();
+        assert_eq!(connections, 3);
+        assert_eq!(headers.len(), 3);
+    }
 }
 
 #[cfg(test)]

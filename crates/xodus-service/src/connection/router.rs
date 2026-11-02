@@ -1,24 +1,18 @@
-use std::sync::Arc;
-
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
-use xodus::models::secrets::LegacyToken;
-use xodus::tokens::TokenManager;
 
 use crate::simple_context::SimpleContext;
 
 pub async fn route(
     socket: tokio::net::UnixStream,
     token: CancellationToken,
-    device_token: LegacyToken,
-    tokens: Arc<TokenManager>,
+    context: SimpleContext,
 ) {
     // Leave room for the existing90s licence response inside the runtime95s budget.
     route_with_budget(
         socket,
         token,
-        device_token,
-        tokens,
+        context,
         std::time::Duration::from_secs(92),
     )
     .await;
@@ -27,14 +21,12 @@ pub async fn route(
 async fn route_with_budget(
     mut socket: tokio::net::UnixStream,
     token: CancellationToken,
-    device_token: LegacyToken,
-    tokens: Arc<TokenManager>,
+    mut context: SimpleContext,
     budget: std::time::Duration,
 ) {
     let cred = socket.peer_cred().ok().and_then(|cred| cred.pid());
     tracing::debug!("Connection from pid {cred:?}");
 
-    let mut context = SimpleContext::new(device_token, tokens);
     loop {
         // One budget includes framing, upstream work, body parsing and reply.
         // Cancellation drops the in-flight async I/O rather than waiting for
@@ -73,8 +65,11 @@ async fn route_with_budget(
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xodus::models::secrets::LegacyToken;
+    use xodus::tokens::TokenManager;
 
     fn credentials() -> LegacyToken {
         LegacyToken {
@@ -105,8 +100,7 @@ mod deadline_tests {
             route_with_budget(
                 server,
                 cancellation,
-                credentials(),
-                Arc::new(TokenManager::with_memory()),
+                SimpleContext::new(credentials(), Arc::new(TokenManager::with_memory())),
                 Duration::from_millis(80),
             ),
         )
@@ -151,8 +145,7 @@ mod deadline_tests {
         let task = tokio::spawn(route_with_budget(
             server,
             token,
-            credentials(),
-            Arc::new(TokenManager::with_memory()),
+            SimpleContext::new(credentials(), Arc::new(TokenManager::with_memory())),
             Duration::from_secs(2),
         ));
         let request = crate::connection::encode_message(crate::XML_MAGIC, 1, b"ping".to_vec());
