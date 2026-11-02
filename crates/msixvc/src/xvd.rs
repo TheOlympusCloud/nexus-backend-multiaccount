@@ -42,6 +42,10 @@ mod resume_tests;
 #[path = "encrypted_image_tests.rs"]
 mod encrypted_image_tests;
 
+#[cfg(test)]
+#[path = "download_throughput_tests.rs"]
+mod throughput_tests;
+
 pub struct SyncSubstream<R> {
     inner: R,
     start: u64,
@@ -921,6 +925,10 @@ impl XvdFile {
         let mut page_in_section = page_start + resume_offset / PAGE_SIZE as u64;
         let page_length = sfile.length.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
         let mut pending = bytes::BytesMut::new();
+        // Avoid one blocking filesystem write/task per decrypted 4KiB page.
+        // Bounded independently of HTTP frame sizes and parallel file count.
+        const WRITE_BATCH: usize = 256 * 1024;
+        let mut write_batch = Vec::with_capacity(WRITE_BATCH);
         let mut v: u64 = resume_offset;
         let mut last_checkpoint = resume_offset;
         let start = sfile.offset.checked_add(v).ok_or(TransferError::new("transfer-range", 0))?;
@@ -935,6 +943,8 @@ impl XvdFile {
                     // Release the HTTP connection while parked. Resuming issues
                     // a fresh Range request at v, preserving pending partial pages.
                     transfer.disconnect();
+                    out.write_all(&write_batch).await?;
+                    write_batch.clear();
                     out.flush().await?;
                     checkpoint(sfile.length - remaining)?;
                     control.wait_for(|paused| !*paused).await.ok();
@@ -959,6 +969,8 @@ impl XvdFile {
                 result => {
                     // Only fully written pages become durable, never a pending
                     // partial encrypted page or merely reported progress.
+                    out.write_all(&write_batch).await?;
+                    write_batch.clear();
                     out.flush().await?;
                     checkpoint(sfile.length - remaining)?;
                     return Err(Box::new(result.err().unwrap_or(TransferError::new("transfer-eof", 0))));
@@ -1011,13 +1023,19 @@ impl XvdFile {
                 } else {
                     to_write_remaining
                 };
-                out.write_all(&page[..to_write]).await?;
+                write_batch.extend_from_slice(&page[..to_write]);
+                if write_batch.len() >= WRITE_BATCH {
+                    out.write_all(&write_batch).await?;
+                    write_batch.clear();
+                }
                 remaining -= to_write_remaining as u64;
 
                 page_in_section += 1;
             }
             let written = sfile.length - remaining;
             if written.saturating_sub(last_checkpoint) >= 32 * 1024 * 1024 {
+                out.write_all(&write_batch).await?;
+                write_batch.clear();
                 out.flush().await?;
                 checkpoint(written)?;
                 last_checkpoint = written;
@@ -1029,6 +1047,7 @@ impl XvdFile {
                 remaining, sfile.length, v
             ))));
         }
+        out.write_all(&write_batch).await?;
         out.flush().await?;
         checkpoint(sfile.length)?;
         Ok(())
