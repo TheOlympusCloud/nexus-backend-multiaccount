@@ -224,6 +224,6 @@ The launcher enables the feature when `login --help` lists `--player`.
 
 The in-game sign-in reply carries the player's `XboxMsaAccountId` and the Store
 account's `StoreMsaAccountId`, so `XUserIsStoreUser` is false while the
-accounts differ, as on Windows. Both are omitted if the player session changes
-during the exchange. Games that check the subscription through the Xbox account
+accounts differ, as on Windows. Both are omitted if either account's session
+changes during the exchange. Games that check the subscription through the Xbox account
 can still refuse.

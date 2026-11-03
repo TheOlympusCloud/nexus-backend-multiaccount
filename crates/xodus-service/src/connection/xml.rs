@@ -58,6 +58,8 @@ pub async fn parse_message(
             // In-game Xbox sign-in uses the separate player account when one is signed in.
             let player = context.tokens().player_account()?;
             let mut identity_session = player.user_token_snapshot()?;
+            // The Store account the ticket is paired with, as the exchange starts.
+            let store_session = context.tokens().user_token_snapshot().ok();
             let request_token = identity_session.token();
             let Token::Legacy(token) = request_token else {
                 return Ok(vec![]);
@@ -112,14 +114,13 @@ pub async fn parse_message(
 
             let (user_token, expiry) = accept_user_tokens(&player, &mut identity_session, user_token)?;
             // Store licensing uses the Store account. Pair the Xbox ticket's
-            // MSA principal with it only while the ticket's own session is
-            // unchanged; never infer either account identifier from an Xbox XUID.
-            let current_identity = player.get_user_sts_session().ok().flatten();
-            let store_identity = context.tokens().get_user_sts_session().ok().flatten();
+            // MSA principal with it only while both sessions are unchanged;
+            // never infer either account identifier from an Xbox XUID.
             let (xbox_msa_account_id, store_msa_account_id) = crate::account_metadata::bound_ids(
-                identity_session.user(),
-                current_identity.as_ref().map(|(user, _)| user),
-                store_identity.as_ref().map(|(user, _)| user),
+                &player,
+                &identity_session,
+                context.tokens(),
+                store_session.as_ref(),
             );
             let payload = MSATokenResponse {
                 token: user_token,
