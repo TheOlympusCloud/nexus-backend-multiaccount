@@ -27,8 +27,8 @@ use xodus::tokens::TokenManager;
 const ENDPOINT: &str = "https://beige.xboxservices.com/pcgafd/config/offlinepc";
 const RELYING_PARTY: &str = "http://mp.microsoft.com/";
 // Same client identity Xodus uses for its Xbox sign-in flows.
-const CLIENT_ID: &str = "000000004424da1f";
-const TITLE_ID: i64 = 704208617;
+pub(super) const CLIENT_ID: &str = "000000004424da1f";
+pub(super) const TITLE_ID: i64 = 704208617;
 const MAX_BODY: usize = 64 * 1024;
 
 fn diagnostic(stage: &str, status: u16) {

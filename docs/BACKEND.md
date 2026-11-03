@@ -207,12 +207,15 @@ callbacks; the API foundation performs no automatic writes.
 `login --player` stores a second Microsoft account in its own keyring record,
 `player-session`, beside the Store account's `user-session`. Both share the
 device identity. As with separate Microsoft Store and Xbox app accounts on
-Windows, the player account is used for Xbox features: `profile`, `social`,
-`native-social`, `game-activity`, `achievements`, the PlayFab ticket for `run`
-and the in-game MSA ticket from `xodus-service`. Licenses, `library`,
+Windows, the player account is used for Xbox features: the gamertag and
+picture from `profile`, `social`, `native-social`, `game-activity`,
+`achievements`, the PlayFab ticket for `run` and the in-game MSA ticket from
+`xodus-service`. Licenses, `library`, the Game Pass status in `profile`,
 downloads, the launch license, in-game Store license and update requests and
-`offline-pc` always use the Store account. Without a player session every
-command uses the Store account as before; no migration is needed.
+`offline-pc` always use the Store account. Games then renew only the player's
+session, so `run` renews the Store session the way `offline-pc` does once less
+than half of its lifetime remains. Without a player session every command uses
+the Store account as before; no migration is needed.
 
 `account --json --player` reports the player account in the same format as
 `account --json`. `logout --player` removes only the player session and cannot

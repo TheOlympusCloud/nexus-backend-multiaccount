@@ -263,8 +263,7 @@ fn command_tokens(
         SubCommand::Login { player: true }
         | SubCommand::Logout { player: true, .. }
         | SubCommand::Account { player: true, .. } => Ok(tokens.player_session()),
-        SubCommand::Profile { .. }
-        | SubCommand::NativeSocial { .. }
+        SubCommand::NativeSocial { .. }
         | SubCommand::Social { .. }
         | SubCommand::GameActivity { .. }
         | SubCommand::Achievements { .. } => tokens.player_account(),
@@ -583,13 +582,14 @@ mod cli_player_tests {
         session(&tokens, "store");
         session(&tokens.player_session(), "player");
         let user = |args: &[&str]| command_tokens(&parse(args).unwrap().command, &tokens).unwrap().get_user().unwrap().username;
-        let xbox: [&[&str]; 8] = [&["profile", "--json"], &["social", "--json"], &["native-social", "listen"], &["game-activity", "1", "--json"],
+        let xbox: [&[&str]; 7] = [&["social", "--json"], &["native-social", "listen"], &["game-activity", "1", "--json"],
             &["achievements", "1", "--json"], &["account", "--json", "--player"], &["logout", "--player"], &["login", "--player"]];
         for args in xbox { assert_eq!(user(args), "player", "{args:?}"); }
-        let store: [&[&str]; 7] = [&["library", "--json"], &["account", "--json"], &["logout", "--device"], &["login"], &["offline-pc"],
-            &["download", "9NBLGGH4R315"], &["run", "/game", "/wine"]];
+        // profile reads the player itself and keeps the Game Pass badge on the Store account.
+        let store: [&[&str]; 8] = [&["profile", "--json"], &["library", "--json"], &["account", "--json"], &["logout", "--device"], &["login"],
+            &["offline-pc"], &["download", "9NBLGGH4R315"], &["run", "/game", "/wine"]];
         for args in store { assert_eq!(user(args), "store", "{args:?}"); }
         tokens.player_session().remove_persistent().unwrap();
-        assert_eq!(user(&["profile", "--json"]), "store");
+        assert_eq!(user(&["social", "--json"]), "store");
     }
 }

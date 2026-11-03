@@ -38,6 +38,24 @@ async fn playfab_auth_header(client: &reqwest::Client, tokens: &TokenManager) ->
     xodus::api::xbox::get_xsts_auth_header(xsts).ok()
 }
 
+/// With a separate Xbox player, games renew only the player's session. The Store session is
+/// renewed at launch once less than half of its lifetime remains, as offline-pc renews it.
+fn store_session_needs_renewal(tokens: &TokenManager, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if tokens.player_session().get_user().is_err() {
+        return false;
+    }
+    let Ok(Token::Legacy(token)) = tokens.get_user_sts_token() else {
+        return false;
+    };
+    let (Ok(created), Ok(expires)) = (
+        chrono::DateTime::parse_from_rfc3339(&token.lifetime.created),
+        chrono::DateTime::parse_from_rfc3339(&token.lifetime.expires),
+    ) else {
+        return false;
+    };
+    now >= created + (expires - created) / 2
+}
+
 const LAUNCH_STUB_SUFFIX: &str = ".xodus-launch.exe";
 const LAUNCH_VIEW_PREFIXES: [&str; 3] = [".xodus-chain-", ".xodus-offline-", ".xodus-mounts-"];
 const LAUNCH_VIEW_LOCK_SUFFIX: &str = ".lock";
@@ -887,6 +905,10 @@ pub async fn run(
     }
 
     let license_cache = license_cache.map(PathBuf::from);
+    if !offline && store_session_needs_renewal(tokens, chrono::Utc::now()) {
+        // Best effort: if renewal fails, the license request below reports the sign-in problem.
+        let _ = xodus::auth::do_sisu(client, tokens, super::offline_pc::CLIENT_ID, super::offline_pc::TITLE_ID).await;
+    }
     let license = get_license(
         client,
         tokens,
@@ -1129,6 +1151,21 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn store_session_renews_only_with_a_separate_player_after_half_its_lifetime() {
+        let tokens = TokenManager::with_memory();
+        let user = |name: &str| xodus::models::secrets::User { puid: name.into(), username: name.into() };
+        let store = Token::Legacy(xodus::models::secrets::LegacyToken { key_name: None, token: "synthetic".into(), binary_secret: None, tpm_key: None,
+            lifetime: xodus::models::soap::Timestamp { id: None, created: "2026-01-01T00:00:00Z".into(), expires: "2026-01-11T00:00:00Z".into() } });
+        tokens.save_user_session(user("store"), HashMap::from([(xodus::tokens::PASSPORT_STS.into(), store)])).unwrap();
+        let at = |value: &str| chrono::DateTime::parse_from_rfc3339(value).unwrap().with_timezone(&chrono::Utc);
+        // Without a separate player, games renew the Store session as before.
+        assert!(!store_session_needs_renewal(&tokens, at("2026-01-09T00:00:00Z")));
+        tokens.player_session().save_user_session(user("player"), HashMap::from([(xodus::tokens::PASSPORT_STS.into(), Token::Compact("player".into()))])).unwrap();
+        assert!(!store_session_needs_renewal(&tokens, at("2026-01-05T23:00:00Z")));
+        assert!(store_session_needs_renewal(&tokens, at("2026-01-06T00:00:00Z")));
+        assert!(store_session_needs_renewal(&tokens, at("2026-01-12T00:00:00Z")));
+    }
     use std::io::Write;
     use std::os::fd::AsRawFd;
 

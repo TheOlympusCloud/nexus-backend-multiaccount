@@ -128,17 +128,28 @@ async fn profile(tokens: &TokenManager) -> Result<Value, &'static str> {
     Ok(json!({ "schema": 1, "account": account, "gamertag": gamertag, "gamerpicDataUrl": image }))
 }
 
+/// The gamertag and picture belong to the Xbox player (the separate player account when one
+/// is signed in); the Game Pass badge to the Store account, whose subscription grants the library.
+fn accounts(tokens: &TokenManager) -> Result<(TokenManager, Option<String>, Option<String>), xodus::tokens::store::TokenStoreError> {
+    let player = tokens.player_account()?;
+    let account = player.get_user().ok().map(|user| user.username);
+    Ok((player, account, tokens.get_user().ok().map(|user| user.username)))
+}
+
 pub async fn run(tokens: &TokenManager, json_output: bool) -> ExitCode {
-    let account = tokens.get_user().ok().map(|user|user.username);
+    let (player, account, store) = match accounts(tokens) {
+        Ok(accounts) => accounts,
+        Err(error) => { error.report(); return ExitCode::FAILURE; }
+    };
     let membership = async {
-        match account.as_deref() {
-            Some(account) => super::subscription::lookup(tokens, account).await,
+        match store.as_deref() {
+            Some(store) => super::subscription::lookup(tokens, store).await,
             None => json!({"status":"unknown"}),
         }
     };
     // Independent optional membership lookup must not delay the profile request
     // beyond its existing deadline or trigger interactive authentication.
-    let (result, subscription) = tokio::join!(tokio::time::timeout(Duration::from_secs(45), profile(tokens)), membership);
+    let (result, subscription) = tokio::join!(tokio::time::timeout(Duration::from_secs(45), profile(&player)), membership);
     match result {
         Ok(Ok(mut value)) => {
             if value["account"].as_str() == account.as_deref() { value["subscription"] = subscription; }
@@ -153,6 +164,19 @@ pub async fn run(tokens: &TokenManager, json_output: bool) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_reads_the_player_with_the_store_account_badge() {
+        let tokens = TokenManager::with_memory();
+        let session = |manager: &TokenManager, name: &str| manager.save_user_session(
+            xodus::models::secrets::User { puid: name.into(), username: name.into() },
+            std::collections::HashMap::from([(xodus::tokens::PASSPORT_STS.into(), Token::Compact(name.into()))])).unwrap();
+        session(&tokens, "store");
+        let (player, account, store) = accounts(&tokens).unwrap();
+        assert_eq!((player.get_user().unwrap().username.as_str(), account.as_deref(), store.as_deref()), ("store", Some("store"), Some("store")));
+        session(&tokens.player_session(), "player");
+        let (player, account, store) = accounts(&tokens).unwrap();
+        assert_eq!((player.get_user().unwrap().username.as_str(), account.as_deref(), store.as_deref()), ("player", Some("player"), Some("store")));
+    }
     #[test]fn social_memory_cache_is_separate_for_accounts_sessions_and_audiences_and_can_be_invalidated(){
         let mut user=xodus::models::secrets::LegacyToken{key_name:None,token:"synthetic-credential".into(),binary_secret:None,tpm_key:None,
             lifetime:soap::Timestamp{id:None,created:"2026-01-01T00:00:00Z".into(),expires:"2099-01-01T00:00:00Z".into()}};
