@@ -260,9 +260,10 @@ fn command_tokens(
     tokens: &TokenManager,
 ) -> Result<TokenManager, xodus::tokens::store::TokenStoreError> {
     match command {
-        SubCommand::Login { player: true }
-        | SubCommand::Logout { player: true, .. }
-        | SubCommand::Account { player: true, .. } => Ok(tokens.player_session()),
+        // A player is only added next to a signed-in Store account; a player saved without one
+        // would silently become the Xbox identity of whichever Store account signs in next.
+        SubCommand::Login { player: true } => tokens.get_user().map(|_| tokens.player_session()),
+        SubCommand::Logout { player: true, .. } | SubCommand::Account { player: true, .. } => Ok(tokens.player_session()),
         SubCommand::NativeSocial { .. }
         | SubCommand::Social { .. }
         | SubCommand::GameActivity { .. }
@@ -571,6 +572,22 @@ mod cli_player_tests {
         // The launcher enables the feature only when `login --help` lists it.
         let mut command = <CliArgs as clap::CommandFactory>::command();
         assert!(command.find_subcommand_mut("login").unwrap().render_help().to_string().contains("--player"));
+    }
+
+    #[test]
+    fn cli_player_login_requires_a_store_account() {
+        let tokens = TokenManager::with_memory();
+        let login = parse(&["login", "--player"]).unwrap().command;
+        // Otherwise the saved player silently becomes the Xbox identity of the next Store sign-in.
+        assert!(matches!(command_tokens(&login, &tokens), Err(xodus::tokens::store::TokenStoreError::NotFound)));
+        tokens.save_user_session(User { puid: "store".into(), username: "store".into() },
+            std::collections::HashMap::from([(xodus::tokens::PASSPORT_STS.into(), Token::Compact("store".into()))])).unwrap();
+        assert!(command_tokens(&login, &tokens).unwrap().get_user().is_err(), "player login writes the empty player record");
+        // Signing the player out or reading its status needs no Store account.
+        let empty = TokenManager::with_memory();
+        for args in [&["logout", "--player"][..], &["account", "--json", "--player"]] {
+            assert!(command_tokens(&parse(args).unwrap().command, &empty).is_ok(), "{args:?}");
+        }
     }
 
     #[test]

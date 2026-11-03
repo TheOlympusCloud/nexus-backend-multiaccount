@@ -217,8 +217,9 @@ session, so `run` renews the Store session the way `offline-pc` does once less
 than half of its lifetime remains. Without a player session every command uses
 the Store account as before; no migration is needed.
 
-`account --json --player` reports the player account in the same format as
-`account --json`. `logout --player` removes only the player session and cannot
+`login --player` requires a signed-in Store account and otherwise fails with
+`keyring-missing-data`. `account --json --player` reports the player account in
+the same format as `account --json`. `logout --player` removes only the player session and cannot
 be combined with `--device`; signing out the Store account also removes it.
 The launcher enables the feature when `login --help` lists `--player`.
 
