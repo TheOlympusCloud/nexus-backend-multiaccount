@@ -201,3 +201,26 @@ interface. Explicit writes use the signed session and are never silently retried
 The launcher exposes these operations through a separate `nativeSocial` IPC API.
 Window, party and overlay features register their own authorized senders and lifecycle
 callbacks; the API foundation performs no automatic writes.
+
+## Separate Xbox player account
+
+`login --player` stores a second Microsoft account in its own keyring record,
+`player-session`, beside the Store account's `user-session`. Both share the
+device identity. As with separate Microsoft Store and Xbox app accounts on
+Windows, the player account is used for Xbox features: `profile`, `social`,
+`native-social`, `game-activity`, `achievements`, the PlayFab ticket for `run`
+and the in-game MSA ticket from `xodus-service`. Licenses, `library`,
+downloads, the launch license, in-game Store license and update requests and
+`offline-pc` always use the Store account. Without a player session every
+command uses the Store account as before; no migration is needed.
+
+`account --json --player` reports the player account in the same format as
+`account --json`. `logout --player` removes only the player session and cannot
+be combined with `--device`; signing out the Store account also removes it.
+The launcher enables the feature when `login --help` lists `--player`.
+
+The in-game sign-in reply carries the player's `XboxMsaAccountId` and the Store
+account's `StoreMsaAccountId`, so `XUserIsStoreUser` is false while the
+accounts differ, as on Windows. Both are omitted if the player session changes
+during the exchange. Games that check the subscription through the Xbox account
+can still refuse.
