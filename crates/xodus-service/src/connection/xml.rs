@@ -4,6 +4,7 @@ use xodus::models::secrets::Token;
 use xodus::models::soap;
 use xodus::models::xgameruntime::xuser::{MSATokenRequest, MSATokenResponse};
 use xodus::proto::xodus::XodusMessageType;
+use xodus::tokens::TokenManager;
 
 use crate::XML_MAGIC;
 use crate::simple_context::SimpleContext;
@@ -54,7 +55,9 @@ pub async fn parse_message(
             let string_buf = std::str::from_utf8(&buffer)?;
             tracing::debug!("String buffer: {string_buf:?}");
             let req = quick_xml::de::from_str::<MSATokenRequest>(string_buf)?;
-            let mut identity_session = context.tokens().user_token_snapshot()?;
+            // In-game Xbox sign-in uses the separate player account when one is signed in.
+            let player = context.tokens().player_account()?;
+            let mut identity_session = player.user_token_snapshot()?;
             let request_token = identity_session.token();
             let Token::Legacy(token) = request_token else {
                 return Ok(vec![]);
@@ -107,14 +110,16 @@ pub async fn parse_message(
             )
             .await?;
 
-            let (user_token, expiry) = accept_user_tokens(context, &mut identity_session, user_token)?;
-            // Store licensing uses this same session facade. Bind the
-            // Xbox ticket's MSA principal to its current Store account,
-            // never infer either account identifier from an Xbox XUID.
-            let current_identity = context.tokens().get_user_sts_session().ok().flatten();
+            let (user_token, expiry) = accept_user_tokens(&player, &mut identity_session, user_token)?;
+            // Store licensing uses the Store account. Pair the Xbox ticket's
+            // MSA principal with it only while the ticket's own session is
+            // unchanged; never infer either account identifier from an Xbox XUID.
+            let current_identity = player.get_user_sts_session().ok().flatten();
+            let store_identity = context.tokens().get_user_sts_session().ok().flatten();
             let (xbox_msa_account_id, store_msa_account_id) = crate::account_metadata::bound_ids(
                 identity_session.user(),
                 current_identity.as_ref().map(|(user, _)| user),
+                store_identity.as_ref().map(|(user, _)| user),
             );
             let payload = MSATokenResponse {
                 token: user_token,
@@ -134,13 +139,13 @@ pub async fn parse_message(
 }
 
 fn accept_user_tokens(
-    context: &SimpleContext,
+    tokens: &TokenManager,
     snapshot: &mut xodus::tokens::manager::UserTokenSnapshot,
     outcome: ExchangeUserTokenOutcome,
 ) -> Result<(String, i64), Box<dyn std::error::Error + Send + Sync>> {
     // Parse every token and its expiry before any credential-store mutation.
     let selected = xodus::auth::issued_user_tokens(outcome)?;
-    context.tokens().accept_user_token_refresh(snapshot, selected.refreshed)?;
+    tokens.accept_user_token_refresh(snapshot, selected.refreshed)?;
     Ok((selected.token, selected.expiry))
 }
 
@@ -154,7 +159,7 @@ mod token_response_tests {
     fn accept_user_tokens(context: &SimpleContext, outcome: ExchangeUserTokenOutcome)
         -> Result<(String, i64), Box<dyn std::error::Error + Send + Sync>> {
         let mut snapshot = context.tokens().user_token_snapshot()?;
-        super::accept_user_tokens(context, &mut snapshot, outcome)
+        super::accept_user_tokens(context.tokens(), &mut snapshot, outcome)
     }
 
     fn response(kind: &str, value: &str) -> soap::RequestSecurityTokenResponse {
@@ -289,6 +294,21 @@ mod token_response_tests {
         );
     }
     #[test]
+    fn token_response_player_refresh_updates_only_player_session() {
+        let context = context();
+        let user = |name: &str| xodus::models::secrets::User { puid: name.into(), username: name.into() };
+        let tickets = |name: &str| std::collections::HashMap::from([(PASSPORT_STS.into(), Token::Compact(name.into()))]);
+        context.tokens().save_user_session(user("store"), tickets("store-ticket")).unwrap();
+        context.tokens().player_session().save_user_session(user("player"), tickets("player-ticket")).unwrap();
+        let player = context.tokens().player_account().unwrap();
+        let mut snapshot = player.user_token_snapshot().unwrap();
+        let values = vec![response("urn:passport:compact", "player-xbox-ticket"), response("urn:passport:legacy", "")];
+        let (ticket, _) = super::accept_user_tokens(&player, &mut snapshot, collection(values)).unwrap();
+        assert_eq!(ticket, "player-xbox-ticket");
+        assert!(matches!(player.get_user_sts_token().unwrap(), Token::Legacy(_)));
+        assert!(matches!(context.tokens().get_user_sts_token().unwrap(), Token::Compact(value) if value == "store-ticket"));
+    }
+    #[test]
     fn token_response_stale_session_never_returns_a_ticket_or_changes_credentials() {
         for replace in [false, true] {
             for with_refresh in [false, true] {
@@ -301,7 +321,7 @@ mod token_response_tests {
                 if replace { session("b"); } else { context.tokens().remove_persistent().unwrap(); }
                 let mut values = vec![response("urn:passport:compact", "old-account-ticket")];
                 if with_refresh { values.push(response("urn:passport:legacy", "")); }
-                let result = super::accept_user_tokens(&context, &mut snapshot, collection(values));
+                let result = super::accept_user_tokens(context.tokens(), &mut snapshot, collection(values));
                 assert!(result.is_err(), "a stale account response was accepted");
                 match context.tokens().get_user_token_for(PASSPORT_STS).unwrap() {
                     Some(Token::Compact(value)) if replace => assert_eq!(value, "b"),
