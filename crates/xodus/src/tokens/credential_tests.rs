@@ -403,3 +403,78 @@ async fn credential_valid_initialization_preserves_identity_and_tokens_without_n
         .unwrap();
     assert_eq!(*backend.values.lock().unwrap(), before);
 }
+
+#[test]
+fn credential_player_session_is_separate_and_store_logout_removes_it() {
+    let (backend, store) = setup();
+    store.save_device_token(super::PASSPORT_STS.into(), Token::Compact("device".into())).unwrap();
+    store.save_user_session(user("store"), session_tokens("store-token")).unwrap();
+    let player = store.player_session();
+    assert!(matches!(player.get_user(), Err(TokenStoreError::NotFound)));
+    player.save_user_session(user("player"), session_tokens("player-token")).unwrap();
+    assert_eq!(store.get_user().unwrap().username, "store");
+    assert_eq!(player.get_user().unwrap().username, "player");
+    assert!(matches!(store.get_user_sts_token().unwrap(), Token::Compact(value) if value == "store-token"));
+    assert!(matches!(player.get_user_sts_token().unwrap(), Token::Compact(value) if value == "player-token"));
+    // Signing out only the player keeps the Store account and the device.
+    player.remove_persistent().unwrap();
+    assert!(matches!(player.get_user(), Err(TokenStoreError::NotFound)));
+    assert_eq!(store.get_user().unwrap().username, "store");
+    assert!(store.get_device_sts_token().is_ok());
+    // A Store sign-out leaves no Xbox credentials behind.
+    player.save_user_session(user("player"), session_tokens("player-token")).unwrap();
+    store.remove_persistent().unwrap();
+    assert!(!backend.values.lock().unwrap().contains_key("player-session"));
+    assert!(store.get_user().is_err());
+}
+
+#[test]
+fn credential_player_account_falls_back_to_store() {
+    let (backend, store) = setup();
+    store.save_user_session(user("store"), session_tokens("store-token")).unwrap();
+    assert_eq!(store.player_account().unwrap().get_user().unwrap().username, "store");
+    store.player_session().save_user_session(user("player"), session_tokens("player-token")).unwrap();
+    let player = store.player_account().unwrap();
+    assert!(matches!(player.get_user_sts_session().unwrap(), Some((account, Token::Compact(value))) if account.username == "player" && value == "player-token"));
+    store.player_session().remove_persistent().unwrap();
+    assert_eq!(store.player_account().unwrap().get_user().unwrap().username, "store");
+    // An unreadable keyring is an error, never a silent switch to the Store account.
+    *backend.read_error.lock().unwrap() = true;
+    assert!(store.player_account().is_err());
+}
+
+#[test]
+fn credential_player_role_never_uses_legacy_records() {
+    let (backend, store) = setup();
+    store.save_user(&user("legacy")).unwrap();
+    store.save_user_token(super::PASSPORT_STS.into(), Token::Compact("legacy-token".into())).unwrap();
+    let before = backend.values.lock().unwrap().clone();
+    let player = store.player_session();
+    assert!(matches!(player.get_user(), Err(TokenStoreError::NotFound)));
+    assert!(player.get_user_token_for(super::PASSPORT_STS).unwrap().is_none());
+    assert!(matches!(player.user_token_snapshot(), Err(TokenStoreError::NotFound)));
+    assert!(matches!(player.save_user_token("renewed".into(), Token::Compact("renewed".into())), Err(TokenStoreError::NotFound)));
+    assert!(matches!(player.save_user(&user("player")), Err(TokenStoreError::NotFound)));
+    assert_eq!(*backend.values.lock().unwrap(), before);
+    assert_eq!(store.player_account().unwrap().get_user().unwrap().username, "legacy");
+}
+
+#[test]
+fn credential_player_refresh_updates_only_player_session() {
+    let (backend, store) = setup();
+    store.save_user_session(user("store"), session_tokens("store-token")).unwrap();
+    let player = store.player_session();
+    player.save_user_session(user("player"), session_tokens("player-token")).unwrap();
+    let store_record = backend.values.lock().unwrap()["user-session"].clone();
+    let mut snapshot = player.user_token_snapshot().unwrap();
+    assert_eq!(snapshot.user().unwrap().username, "player");
+    player.accept_user_token_refresh(&mut snapshot, Some(("renewed".into(), Token::Compact("renewed-token".into())))).unwrap();
+    assert!(player.get_user_token_for("renewed").unwrap().is_some());
+    assert!(store.get_user_token_for("renewed").unwrap().is_none());
+    assert_eq!(backend.values.lock().unwrap()["user-session"], store_record);
+    // A player replaced mid-request cannot store the old account's refresh.
+    let mut stale = player.user_token_snapshot().unwrap();
+    player.save_user_session(user("other"), session_tokens("other-token")).unwrap();
+    assert!(matches!(player.accept_user_token_refresh(&mut stale, Some(("late".into(), Token::Compact("late".into())))), Err(TokenStoreError::SessionChanged)));
+    assert!(player.get_user_token_for("late").unwrap().is_none());
+}

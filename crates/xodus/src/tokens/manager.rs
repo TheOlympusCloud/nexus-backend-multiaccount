@@ -17,6 +17,8 @@ mod keys {
     pub const USER_TOKENS: &str = "user-tokens";
     pub const USER_INFO: &str = "user-DA";
     pub const USER_SESSION: &str = "user-session";
+    /// A separate Xbox player account beside the Store account in `user-session`.
+    pub const PLAYER_SESSION: &str = "player-session";
     pub const USER_GENERATION: &str = "user-token-generation";
 }
 
@@ -72,6 +74,8 @@ mod credential_account_metadata_tests {
 pub struct TokenManager {
     persistent: Arc<dyn TokenBackend>,
     ephemeral: Arc<dyn ExpiringTokenBackend>,
+    /// Keyring record of this manager's account: the Store account or the Xbox player.
+    session: &'static str,
 }
 
 impl TokenManager {
@@ -82,7 +86,25 @@ impl TokenManager {
         Self {
             persistent,
             ephemeral,
+            session: keys::USER_SESSION,
         }
+    }
+
+    /// The separate Xbox player account record, stored or not: sign-in, sign-out and status.
+    pub fn player_session(&self) -> Self {
+        Self { session: keys::PLAYER_SESSION, ..self.clone() }
+    }
+
+    /// Account for Xbox features: the separate player account when one is stored,
+    /// otherwise this Store account. Licenses and the library never use it.
+    pub fn player_account(&self) -> Result<Self, TokenStoreError> {
+        let player = self.player_session();
+        Ok(if player.user_session()?.is_some() { player } else { self.clone() })
+    }
+
+    /// Only the Store account has legacy split records and the device to sign out.
+    fn is_store(&self) -> bool {
+        self.session == keys::USER_SESSION
     }
 
     /// Keychain for persistent storage, in-memory for ephemeral - the default
@@ -105,6 +127,11 @@ impl TokenManager {
 
     pub fn remove_persistent(&self) -> Result<(), TokenStoreError> {
         let _update = self.persistent_update()?;
+        if !self.is_store() {
+            return self.persistent.remove(self.session);
+        }
+        // No Xbox player credentials outlive the Store account they were added to.
+        self.persistent.remove(keys::PLAYER_SESSION)?;
         self.invalidate_legacy_requests()?;
         self.persistent.remove(keys::DEVICE_TOKENS)?;
         self.persistent.remove(keys::USER_TOKENS)?;
@@ -160,6 +187,9 @@ impl TokenManager {
         if let Some(session) = self.user_session()? {
             return Ok(session.tokens.get(address).cloned());
         }
+        if !self.is_store() {
+            return Ok(None);
+        }
         Self::read_token_store(&*self.persistent, keys::USER_TOKENS, address)
     }
 
@@ -169,9 +199,12 @@ impl TokenManager {
             session.tokens.insert(address, token);
             return Self::write_verified(
                 &*self.persistent,
-                keys::USER_SESSION,
+                self.session,
                 &serde_json::to_vec(&session)?,
             );
+        }
+        if !self.is_store() {
+            return Err(TokenStoreError::NotFound);
         }
         self.invalidate_legacy_requests()?;
         Self::write_token_store(&*self.persistent, keys::USER_TOKENS, address, token)
@@ -196,6 +229,9 @@ impl TokenManager {
         if let Some(session) = self.user_session()? {
             return Ok(session.user);
         }
+        if !self.is_store() {
+            return Err(TokenStoreError::NotFound);
+        }
         let bytes = self
             .persistent
             .get(keys::USER_INFO)?
@@ -204,6 +240,9 @@ impl TokenManager {
     }
 
     pub fn save_user(&self, user: &User) -> Result<(), TokenStoreError> {
+        if !self.is_store() {
+            return Err(TokenStoreError::NotFound);
+        }
         let _update = self.persistent_update()?;
         self.invalidate_legacy_requests()?;
         Self::write_verified(
@@ -215,7 +254,7 @@ impl TokenManager {
 
     fn user_session(&self) -> Result<Option<UserSession>, TokenStoreError> {
         self.persistent
-            .get(keys::USER_SESSION)?
+            .get(self.session)?
             .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
             .transpose()
     }
@@ -235,7 +274,7 @@ impl TokenManager {
         let session = UserSession { user, tokens, generation: Some(uuid::Uuid::new_v4().to_string()) };
         Self::write_verified(
             &*self.persistent,
-            keys::USER_SESSION,
+            self.session,
             &serde_json::to_vec(&session)?,
         )
     }

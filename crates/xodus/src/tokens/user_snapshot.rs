@@ -52,7 +52,7 @@ impl TokenManager {
                 session.generation = Some(uuid::Uuid::new_v4().to_string());
                 Self::write_verified(
                     &*self.persistent,
-                    keys::USER_SESSION,
+                    self.session,
                     &serde_json::to_vec(&session)?,
                 )?;
             }
@@ -60,6 +60,9 @@ impl TokenManager {
                 source: Source::Session(session),
                 token,
             });
+        }
+        if !self.is_store() {
+            return Err(TokenStoreError::NotFound);
         }
         let tokens = self
             .persistent
@@ -142,7 +145,7 @@ impl TokenManager {
                     session.tokens.insert(address, token);
                     Self::write_verified(
                         &*self.persistent,
-                        keys::USER_SESSION,
+                        self.session,
                         &serde_json::to_vec(&session)?,
                     )?;
                 }
