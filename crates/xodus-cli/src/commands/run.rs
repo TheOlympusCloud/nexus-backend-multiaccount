@@ -25,6 +25,8 @@ use crate::license::get_license;
 const PLAYFAB_RELYING_PARTY: &str = "http://playfab.xboxlive.com/";
 
 async fn playfab_auth_header(client: &reqwest::Client, tokens: &TokenManager) -> Option<String> {
+    // PlayFab is the title's Xbox identity: the separate player account when one is signed in.
+    let tokens = tokens.player_account().ok()?;
     let Ok(Token::Legacy(dev_token)) = tokens.get_device_sts_token() else {
         return None;
     };

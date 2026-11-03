@@ -89,6 +89,8 @@ enum SubCommand {
     Account {
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long, default_value_t = false, help = "Show the separate Xbox player account instead of the Store account")]
+        player: bool,
     },
     #[command(about = "Read Xbox gamertag and gamerpic for the stored account")]
     Profile {
@@ -124,10 +126,24 @@ enum SubCommand {
         #[arg(long, default_value = "US")]
         market: String,
     },
-    Login,
+    Login {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Sign in a separate Microsoft account for Xbox features (profile, cloud saves, achievements, friends); licenses and the library stay with the Store account"
+        )]
+        player: bool,
+    },
     Logout {
         #[arg(long, default_value_t = false, help = "Remove device license")]
         device: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with = "device",
+            help = "Remove only the separate Xbox player account; Xbox features use the Store account again"
+        )]
+        player: bool,
     },
     #[command(about = "Download and extract the game through streaming algorithm")]
     #[command(after_help = "Nexus capabilities: update-recovery-v1")]
@@ -235,6 +251,25 @@ struct CliArgs {
     external_webview_stdio: bool,
     #[command(subcommand)]
     command: SubCommand,
+}
+
+/// Xbox features use the separate player account when one is signed in. Licenses, library,
+/// downloads, launches and the offline-PC designation always use the Store account.
+fn command_tokens(
+    command: &SubCommand,
+    tokens: &TokenManager,
+) -> Result<TokenManager, xodus::tokens::store::TokenStoreError> {
+    match command {
+        SubCommand::Login { player: true }
+        | SubCommand::Logout { player: true, .. }
+        | SubCommand::Account { player: true, .. } => Ok(tokens.player_session()),
+        SubCommand::Profile { .. }
+        | SubCommand::NativeSocial { .. }
+        | SubCommand::Social { .. }
+        | SubCommand::GameActivity { .. }
+        | SubCommand::Achievements { .. } => tokens.player_account(),
+        _ => Ok(tokens.clone()),
+    }
 }
 
 #[tokio::main]
@@ -359,6 +394,14 @@ async fn main() -> ExitCode {
         }
     }
 
+    let tokens = match command_tokens(&args.command, &tokens) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            error.report();
+            return ExitCode::FAILURE;
+        }
+    };
+
     let code = match args.command {
         #[cfg(target_os = "linux")]
         SubCommand::KeyringSessionStop { .. } => unreachable!(),
@@ -387,7 +430,7 @@ async fn main() -> ExitCode {
             .await
         }
         SubCommand::Library { json, market } => commands::library::run(&tokens, json, market).await,
-        SubCommand::Account { json } => match tokens.get_user() {
+        SubCommand::Account { json, .. } => match tokens.get_user() {
             Ok(user) => {
                 if json {
                     println!(
@@ -420,8 +463,8 @@ async fn main() -> ExitCode {
         SubCommand::Social { .. } => commands::social::run(&tokens).await,
         SubCommand::GameActivity { title_id, json } => commands::game_activity::run(&tokens, title_id, json).await,
         SubCommand::Achievements { title_id, json } => commands::achievements::run(&tokens, title_id, json).await,
-        SubCommand::Login => commands::login::run(&client, &tokens).await,
-        SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
+        SubCommand::Login { .. } => commands::login::run(&client, &tokens).await,
+        SubCommand::Logout { device, .. } => commands::logout::run(&tokens, device).await,
         SubCommand::Extract {
             path,
             destination,
@@ -508,4 +551,45 @@ async fn main() -> ExitCode {
     xodus::secrets::destroy_secrets();
 
     code
+}
+
+#[cfg(test)]
+mod cli_player_tests {
+    use super::*;
+    use xodus::models::secrets::{Token, User};
+
+    fn parse(args: &[&str]) -> Result<CliArgs, clap::Error> {
+        CliArgs::try_parse_from(std::iter::once("xodus-cli").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn cli_player_flags_parse() {
+        assert!(matches!(parse(&["login", "--player"]).unwrap().command, SubCommand::Login { player: true }));
+        assert!(matches!(parse(&["login"]).unwrap().command, SubCommand::Login { player: false }));
+        assert!(matches!(parse(&["logout", "--player"]).unwrap().command, SubCommand::Logout { player: true, device: false }));
+        assert!(parse(&["logout", "--player", "--device"]).is_err());
+        assert!(matches!(parse(&["account", "--json", "--player"]).unwrap().command, SubCommand::Account { json: true, player: true }));
+        // The launcher enables the feature only when `login --help` lists it.
+        let mut command = <CliArgs as clap::CommandFactory>::command();
+        assert!(command.find_subcommand_mut("login").unwrap().render_help().to_string().contains("--player"));
+    }
+
+    #[test]
+    fn cli_player_account_routes_only_xbox_commands() {
+        let tokens = TokenManager::with_memory();
+        let session = |manager: &TokenManager, name: &str| manager.save_user_session(
+            User { puid: name.into(), username: name.into() },
+            std::collections::HashMap::from([(xodus::tokens::PASSPORT_STS.into(), Token::Compact(name.into()))])).unwrap();
+        session(&tokens, "store");
+        session(&tokens.player_session(), "player");
+        let user = |args: &[&str]| command_tokens(&parse(args).unwrap().command, &tokens).unwrap().get_user().unwrap().username;
+        let xbox: [&[&str]; 8] = [&["profile", "--json"], &["social", "--json"], &["native-social", "listen"], &["game-activity", "1", "--json"],
+            &["achievements", "1", "--json"], &["account", "--json", "--player"], &["logout", "--player"], &["login", "--player"]];
+        for args in xbox { assert_eq!(user(args), "player", "{args:?}"); }
+        let store: [&[&str]; 7] = [&["library", "--json"], &["account", "--json"], &["logout", "--device"], &["login"], &["offline-pc"],
+            &["download", "9NBLGGH4R315"], &["run", "/game", "/wine"]];
+        for args in store { assert_eq!(user(args), "store", "{args:?}"); }
+        tokens.player_session().remove_persistent().unwrap();
+        assert_eq!(user(&["profile", "--json"]), "store");
+    }
 }
